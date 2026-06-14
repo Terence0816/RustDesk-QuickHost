@@ -36,7 +36,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
-#include <fstream>
 #include <memory>
 #include <new>
 #include <sstream>
@@ -45,6 +44,9 @@
 #include <vector>
 
 #include "zstd.h"
+
+#define ResetPortableHostLog(...) ((void)0)
+#define AppendPortableHostLog(...) ((void)0)
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -570,6 +572,7 @@ constexpr UINT kOptionsMenuSetFixedPassword = 1302;
 constexpr UINT kOptionsMenuDisableRandomPassword = 1303;
 constexpr UINT kOptionsMenuChangeId = 1304;
 constexpr UINT kOptionsMenuLanguage = 1305;
+constexpr UINT kOptionsMenuAbout = 1306;
 constexpr UINT kTrayIconId = 1;
 
 constexpr COLORREF kWindowColor = RGB(35, 35, 35);
@@ -624,6 +627,9 @@ constexpr int kCliprdrResponseOk = 0x1;
 constexpr int kCliprdrFileContentsSizeFlag = 0x00000001;
 constexpr int kCliprdrFileContentsRangeFlag = 0x00000002;
 constexpr size_t kClipboardFileTransferChunkSize = 64 * 1024;
+constexpr size_t kFileTransferBlockSize = 128 * 1024;
+constexpr wchar_t kProjectUrl[] = L"https://github.com/Terence0816/RustDesk-QuickHost";
+constexpr wchar_t kAboutDisplayVersion[] = L"1.1.2.0";
 constexpr wchar_t kCppHostVersion[] = L"1.1.10-cpp";
 constexpr wchar_t kAppWindowTitle[] = L"RustDeskQS Host";
 constexpr wchar_t kAppWindowClassName[] = L"RustDeskCppPortableHostWindow";
@@ -647,6 +653,9 @@ const LanguageEntry kTraditionalChineseLanguageEntries[] = {
     {L"menu_disable_random_password", L"停用隨機密碼"},
     {L"menu_change_id", L"更改 ID"},
     {L"menu_language", L"語言"},
+    {L"menu_about", L"\u95dc\u65bc"},
+    {L"button_check_updates", L"\u6aa2\u67e5\u66f4\u65b0"},
+    {L"msg_open_project_failed", L"\u7121\u6cd5\u958b\u555f\u5c08\u6848\u7db2\u5740\u3002"},
     {L"welcome_title", L"歡迎使用遠端協助"},
     {L"hint_provide_id_password", L"請提供下面的 ID 及密碼"},
     {L"label_id", L"ID"},
@@ -690,6 +699,9 @@ const LanguageEntry kEnglishLanguageEntries[] = {
     {L"menu_disable_random_password", L"Disable Random Password"},
     {L"menu_change_id", L"Change ID"},
     {L"menu_language", L"Language"},
+    {L"menu_about", L"About"},
+    {L"button_check_updates", L"Check for Updates"},
+    {L"msg_open_project_failed", L"Unable to open the project page."},
     {L"welcome_title", L"Remote Support"},
     {L"hint_provide_id_password", L"Share this ID and password"},
     {L"label_id", L"ID"},
@@ -1333,6 +1345,193 @@ struct LoginRequestData {
   std::wstring my_name;
   std::wstring version;
   std::wstring my_platform;
+  bool has_session_id = false;
+  uint64_t session_id = 0;
+  bool has_file_transfer = false;
+  std::wstring file_transfer_dir;
+  bool file_transfer_show_hidden = false;
+};
+
+enum class FileTransferActionKind {
+  kNone,
+  kReadDir,
+  kSend,
+  kReceive,
+  kCreate,
+  kRemoveDir,
+  kRemoveFile,
+  kAllFiles,
+  kCancel,
+  kSendConfirm,
+  kRename,
+  kReadEmptyDirs,
+};
+
+enum class FileTransferResponseKind {
+  kNone,
+  kDir,
+  kBlock,
+  kError,
+  kDone,
+  kDigest,
+  kEmptyDirs,
+};
+
+enum class FileTransferEntryType {
+  kDir = 0,
+  kDirLink = 2,
+  kDirDrive = 3,
+  kFile = 4,
+  kFileLink = 5,
+};
+
+struct FileTransferEntryData {
+  int entry_type = static_cast<int>(FileTransferEntryType::kFile);
+  std::wstring name;
+  bool is_hidden = false;
+  uint64_t size = 0;
+  uint64_t modified_time = 0;
+};
+
+struct FileTransferReadDirData {
+  std::wstring path;
+  bool include_hidden = false;
+};
+
+struct FileTransferSendRequestData {
+  int id = 0;
+  std::wstring path;
+  bool include_hidden = false;
+  int file_num = 0;
+  int file_type = 0;
+};
+
+struct FileTransferReceiveRequestData {
+  int id = 0;
+  std::wstring path;
+  std::vector<FileTransferEntryData> files;
+  int file_num = 0;
+  uint64_t total_size = 0;
+};
+
+struct FileTransferRemoveDirData {
+  int id = 0;
+  std::wstring path;
+  bool recursive = false;
+};
+
+struct FileTransferRemoveFileData {
+  int id = 0;
+  std::wstring path;
+  int file_num = 0;
+};
+
+struct FileTransferCreateDirData {
+  int id = 0;
+  std::wstring path;
+};
+
+struct FileTransferReadAllFilesData {
+  int id = 0;
+  std::wstring path;
+  bool include_hidden = false;
+};
+
+struct FileTransferCancelData {
+  int id = 0;
+};
+
+struct FileTransferSendConfirmData {
+  int id = 0;
+  int file_num = 0;
+  bool has_skip = false;
+  bool skip = false;
+  bool has_offset_blk = false;
+  unsigned int offset_blk = 0;
+};
+
+struct FileTransferRenameData {
+  int id = 0;
+  std::wstring path;
+  std::wstring new_name;
+};
+
+struct FileTransferDoneData {
+  int id = 0;
+  int file_num = 0;
+};
+
+struct FileTransferDigestData {
+  int id = 0;
+  int file_num = 0;
+  uint64_t last_modified = 0;
+  uint64_t file_size = 0;
+  bool is_upload = false;
+  bool is_identical = false;
+  uint64_t transferred_size = 0;
+  bool is_resume = false;
+};
+
+struct FileTransferBlockData {
+  int id = 0;
+  int file_num = 0;
+  std::vector<unsigned char> data;
+  bool compressed = false;
+  unsigned int blk_id = 0;
+};
+
+struct FileTransferErrorData {
+  int id = 0;
+  std::wstring error;
+  int file_num = 0;
+};
+
+struct FileTransferActionData {
+  FileTransferActionKind kind = FileTransferActionKind::kNone;
+  FileTransferReadDirData read_dir;
+  FileTransferSendRequestData send;
+  FileTransferReceiveRequestData receive;
+  FileTransferCreateDirData create;
+  FileTransferRemoveDirData remove_dir;
+  FileTransferRemoveFileData remove_file;
+  FileTransferReadAllFilesData all_files;
+  FileTransferCancelData cancel;
+  FileTransferSendConfirmData send_confirm;
+  FileTransferRenameData rename;
+};
+
+struct FileTransferResponseData {
+  FileTransferResponseKind kind = FileTransferResponseKind::kNone;
+  int dir_id = 0;
+  std::wstring dir_path;
+  std::vector<FileTransferEntryData> dir_entries;
+  FileTransferBlockData block;
+  FileTransferErrorData error;
+  FileTransferDoneData done;
+  FileTransferDigestData digest;
+  std::wstring empty_dirs_path;
+};
+
+struct FileTransferReadJob {
+  int id = 0;
+  std::wstring source_path;
+  std::vector<FileTransferEntryData> files;
+  int file_num = 0;
+  HANDLE file = INVALID_HANDLE_VALUE;
+  bool sent_digest = false;
+  bool waiting_for_confirm = false;
+  bool file_confirmed = false;
+  uint64_t resume_offset = 0;
+};
+
+struct FileTransferWriteJob {
+  int id = 0;
+  std::wstring target_path;
+  std::vector<FileTransferEntryData> files;
+  int current_file_num = -1;
+  HANDLE file = INVALID_HANDLE_VALUE;
+  std::wstring current_temp_path;
+  std::wstring current_final_path;
 };
 
 struct HashMessageData {
@@ -4904,6 +5103,270 @@ bool PromptForTextInput(
   return false;
 }
 
+struct AboutDialogState {
+  HINSTANCE instance = nullptr;
+  HWND owner = nullptr;
+  HWND hwnd = nullptr;
+  HWND icon = nullptr;
+  HWND text = nullptr;
+  HWND ok_button = nullptr;
+  HWND update_button = nullptr;
+  HFONT font = nullptr;
+  std::wstring title;
+  std::wstring about_text;
+  std::wstring ok_text;
+  std::wstring update_text;
+  std::wstring open_failed_text;
+  std::wstring project_url;
+  bool done = false;
+};
+
+LRESULT CALLBACK AboutDialogProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param) {
+  auto* state = reinterpret_cast<AboutDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+  if (message == WM_NCCREATE) {
+    const auto* create_struct = reinterpret_cast<LPCREATESTRUCTW>(l_param);
+    state = reinterpret_cast<AboutDialogState*>(create_struct->lpCreateParams);
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    if (state != nullptr) {
+      state->hwnd = hwnd;
+    }
+  }
+
+  if (state == nullptr) {
+    return DefWindowProcW(hwnd, message, w_param, l_param);
+  }
+
+  switch (message) {
+    case WM_CREATE: {
+      const int margin = ScaleForSystemDpi(16);
+      const int icon_size = ScaleForSystemDpi(32);
+      const int icon_gap = ScaleForSystemDpi(12);
+      const int button_height = ScaleForSystemDpi(28);
+      const int ok_width = ScaleForSystemDpi(88);
+      const int update_width = ScaleForSystemDpi(124);
+      const int button_gap = ScaleForSystemDpi(10);
+      const int button_top_gap = ScaleForSystemDpi(16);
+
+      RECT client_rect = {};
+      GetClientRect(hwnd, &client_rect);
+      const int client_width = client_rect.right - client_rect.left;
+      const int client_height = client_rect.bottom - client_rect.top;
+      const int button_top = client_height - margin - button_height;
+
+      state->icon = CreateWindowExW(
+          0,
+          L"STATIC",
+          nullptr,
+          WS_CHILD | WS_VISIBLE | SS_ICON,
+          margin,
+          margin,
+          icon_size,
+          icon_size,
+          hwnd,
+          nullptr,
+          state->instance,
+          nullptr);
+      if (state->icon != nullptr) {
+        SendMessageW(
+            state->icon,
+            STM_SETIMAGE,
+            IMAGE_ICON,
+            reinterpret_cast<LPARAM>(LoadIconW(nullptr, IDI_INFORMATION)));
+      }
+
+      const int text_left = margin + icon_size + icon_gap;
+      const int text_height = button_top - margin - button_top_gap;
+      state->text = CreateWindowExW(
+          0,
+          L"STATIC",
+          state->about_text.c_str(),
+          WS_CHILD | WS_VISIBLE,
+          text_left,
+          margin,
+          client_width - text_left - margin,
+          text_height,
+          hwnd,
+          nullptr,
+          state->instance,
+          nullptr);
+
+      const int ok_left = client_width - margin - ok_width;
+      const int update_left = ok_left - button_gap - update_width;
+      state->update_button = CreateWindowExW(
+          0,
+          L"BUTTON",
+          state->update_text.c_str(),
+          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+          update_left,
+          button_top,
+          update_width,
+          button_height,
+          hwnd,
+          reinterpret_cast<HMENU>(1001),
+          state->instance,
+          nullptr);
+      state->ok_button = CreateWindowExW(
+          0,
+          L"BUTTON",
+          state->ok_text.c_str(),
+          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+          ok_left,
+          button_top,
+          ok_width,
+          button_height,
+          hwnd,
+          reinterpret_cast<HMENU>(IDOK),
+          state->instance,
+          nullptr);
+
+      const HWND controls[] = {state->text, state->update_button, state->ok_button};
+      for (HWND control : controls) {
+        if (control != nullptr && state->font != nullptr) {
+          SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), TRUE);
+        }
+      }
+
+      if (state->ok_button != nullptr) {
+        SetFocus(state->ok_button);
+      }
+      return 0;
+    }
+    case WM_CTLCOLORSTATIC: {
+      HDC dc = reinterpret_cast<HDC>(w_param);
+      SetBkMode(dc, TRANSPARENT);
+      return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_WINDOW));
+    }
+    case WM_COMMAND: {
+      const UINT command_id = LOWORD(w_param);
+      if (command_id == IDOK || command_id == IDCANCEL) {
+        state->done = true;
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      if (command_id == 1001) {
+        const HINSTANCE open_result = ShellExecuteW(
+            hwnd,
+            L"open",
+            state->project_url.c_str(),
+            nullptr,
+            nullptr,
+            SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(open_result) <= 32) {
+          MessageBoxW(
+              hwnd,
+              state->open_failed_text.c_str(),
+              state->title.c_str(),
+              MB_OK | MB_ICONWARNING);
+          return 0;
+        }
+        state->done = true;
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      break;
+    }
+    case WM_CLOSE:
+      state->done = true;
+      DestroyWindow(hwnd);
+      return 0;
+    case WM_DESTROY:
+      if (state->owner != nullptr) {
+        EnableWindow(state->owner, TRUE);
+        SetForegroundWindow(state->owner);
+      }
+      return 0;
+    default:
+      break;
+  }
+
+  return DefWindowProcW(hwnd, message, w_param, l_param);
+}
+
+void ShowAboutDialogModal(
+    HINSTANCE instance,
+    HWND owner,
+    HFONT font,
+    HICON icon,
+    const std::wstring& title,
+    const std::wstring& about_text,
+    const std::wstring& ok_text,
+    const std::wstring& update_text,
+    const std::wstring& open_failed_text,
+    const std::wstring& project_url) {
+  const wchar_t kAboutWindowClass[] = L"RustDeskCppAboutDialogWindow";
+  WNDCLASSEXW window_class = {};
+  window_class.cbSize = sizeof(window_class);
+  window_class.style = CS_HREDRAW | CS_VREDRAW;
+  window_class.lpfnWndProc = AboutDialogProc;
+  window_class.hInstance = instance;
+  window_class.hIcon = icon != nullptr ? icon : LoadIconW(nullptr, IDI_INFORMATION);
+  window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+  window_class.lpszClassName = kAboutWindowClass;
+  window_class.hIconSm = window_class.hIcon;
+  RegisterClassExW(&window_class);
+
+  AboutDialogState state;
+  state.instance = instance;
+  state.owner = owner;
+  state.font = font;
+  state.title = title;
+  state.about_text = about_text;
+  state.ok_text = ok_text;
+  state.update_text = update_text;
+  state.open_failed_text = open_failed_text;
+  state.project_url = project_url;
+
+  if (owner != nullptr) {
+    EnableWindow(owner, FALSE);
+  }
+
+  const int width = ScaleForSystemDpi(540);
+  const int height = ScaleForSystemDpi(320);
+  RECT owner_rect = {};
+  if (owner != nullptr) {
+    GetWindowRect(owner, &owner_rect);
+  } else {
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &owner_rect, 0);
+  }
+  const int x = owner_rect.left + (((owner_rect.right - owner_rect.left) - width) / 2);
+  const int y = owner_rect.top + (((owner_rect.bottom - owner_rect.top) - height) / 2);
+
+  HWND dialog = CreateWindowExW(
+      WS_EX_DLGMODALFRAME,
+      kAboutWindowClass,
+      title.c_str(),
+      WS_POPUPWINDOW | WS_CAPTION | WS_SYSMENU,
+      x,
+      y,
+      width,
+      height,
+      owner,
+      nullptr,
+      instance,
+      &state);
+  if (dialog == nullptr) {
+    if (owner != nullptr) {
+      EnableWindow(owner, TRUE);
+      SetForegroundWindow(owner);
+    }
+    return;
+  }
+
+  ShowWindow(dialog, SW_SHOWNORMAL);
+  UpdateWindow(dialog);
+
+  MSG message = {};
+  while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
+    if (state.hwnd != nullptr && IsDialogMessageW(state.hwnd, &message)) {
+      continue;
+    }
+    TranslateMessage(&message);
+    DispatchMessageW(&message);
+  }
+}
+
 std::vector<unsigned char> DecodeBase64(const std::string& text) {
   auto decode_char = [](char c) -> int {
     if (c >= 'A' && c <= 'Z') {
@@ -7578,6 +8041,16 @@ bool ParseLoginRequestMessage(
       }
       const unsigned int subfield_number = static_cast<unsigned int>(subtag >> 3U);
       const unsigned int subwire_type = static_cast<unsigned int>(subtag & 0x07U);
+      if (subfield_number == 10U && subwire_type == 0U) {
+        uint64_t session_id = 0;
+        if (!ReadVarint(payload, &payload_offset, &session_id)) {
+          return false;
+        }
+        login_request->has_session_id = true;
+        login_request->session_id = session_id;
+        continue;
+      }
+
       if (subwire_type != 2U) {
         if (!SkipField(subwire_type, payload, &payload_offset)) {
           return false;
@@ -7606,6 +8079,40 @@ bool ParseLoginRequestMessage(
         case 13U:
           login_request->my_platform = Utf8ToWide(std::string(value.begin(), value.end()));
           break;
+        case 7U: {
+          // An empty FileTransfer {} still means the controller explicitly requested
+          // a file-transfer session. The nested payload may be zero-length when the
+          // client keeps the default remote dir and show_hidden=false.
+          login_request->has_file_transfer = true;
+          size_t nested_offset = 0;
+          while (nested_offset < value.size()) {
+            uint64_t nested_tag = 0;
+            if (!ReadVarint(value, &nested_offset, &nested_tag)) {
+              return false;
+            }
+            const unsigned int nested_field_number =
+                static_cast<unsigned int>(nested_tag >> 3U);
+            const unsigned int nested_wire_type =
+                static_cast<unsigned int>(nested_tag & 0x07U);
+            if (nested_field_number == 1U && nested_wire_type == 2U) {
+              std::vector<unsigned char> dir;
+              if (!ReadLengthDelimited(value, &nested_offset, &dir)) {
+                return false;
+              }
+              login_request->file_transfer_dir =
+                  Utf8ToWide(std::string(dir.begin(), dir.end()));
+            } else if (nested_field_number == 2U && nested_wire_type == 0U) {
+              uint64_t show_hidden = 0;
+              if (!ReadVarint(value, &nested_offset, &show_hidden)) {
+                return false;
+              }
+              login_request->file_transfer_show_hidden = show_hidden != 0;
+            } else if (!SkipField(nested_wire_type, value, &nested_offset)) {
+              return false;
+            }
+          }
+          break;
+        }
         default:
           break;
       }
@@ -7613,6 +8120,1733 @@ bool ParseLoginRequestMessage(
     return true;
   }
   return false;
+}
+
+void CloseFileTransferHandle(HANDLE* file) {
+  if (file == nullptr || *file == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  CloseHandle(*file);
+  *file = INVALID_HANDLE_VALUE;
+}
+
+uint64_t FileTimeToUnixSeconds(const FILETIME& file_time) {
+  ULARGE_INTEGER value = {};
+  value.LowPart = file_time.dwLowDateTime;
+  value.HighPart = file_time.dwHighDateTime;
+  if (value.QuadPart < 116444736000000000ULL) {
+    return 0;
+  }
+  return (value.QuadPart - 116444736000000000ULL) / 10000000ULL;
+}
+
+FILETIME UnixSecondsToFileTime(uint64_t unix_seconds) {
+  ULARGE_INTEGER value = {};
+  value.QuadPart = unix_seconds * 10000000ULL + 116444736000000000ULL;
+  FILETIME result = {};
+  result.dwLowDateTime = value.LowPart;
+  result.dwHighDateTime = value.HighPart;
+  return result;
+}
+
+bool ApplyFileTransferModifiedTime(const std::wstring& path, uint64_t unix_seconds) {
+  if (path.empty() || unix_seconds == 0) {
+    return true;
+  }
+  const HANDLE file = CreateFileW(
+      path.c_str(),
+      FILE_WRITE_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  const FILETIME modified = UnixSecondsToFileTime(unix_seconds);
+  const BOOL ok = SetFileTime(file, nullptr, nullptr, &modified);
+  CloseHandle(file);
+  return ok != FALSE;
+}
+
+std::wstring ResolveFileTransferFilesystemPath(const std::wstring& remote_path) {
+  std::wstring normalized = NormalizePathSeparators(Trim(remote_path));
+  if (normalized.empty()) {
+    return L"/";
+  }
+  // RustDesk's file-transfer UI may request the Windows drive list using either
+  // "/" or "\" depending on the navigation path. Treat both as the virtual root
+  // that enumerates all logical drives.
+  if (normalized == L"\\") {
+    return L"/";
+  }
+  if (normalized.size() == 2 && normalized[1] == L':') {
+    normalized += L"\\";
+  }
+  return normalized;
+}
+
+std::wstring JoinWindowsPath(const std::wstring& base, const std::wstring& component) {
+  if (component.empty()) {
+    return NormalizePathSeparators(base);
+  }
+  if (base.empty()) {
+    return NormalizePathSeparators(component);
+  }
+  std::wstring joined = NormalizePathSeparators(base);
+  if (!joined.empty() && joined.back() != L'\\') {
+    joined += L"\\";
+  }
+  joined += NormalizePathSeparators(component);
+  return joined;
+}
+
+std::wstring GetDirectoryPathPart(const std::wstring& path) {
+  const size_t separator = path.find_last_of(L"\\/");
+  if (separator == std::wstring::npos) {
+    return std::wstring();
+  }
+  return path.substr(0, separator);
+}
+
+bool ValidateFileTransferRelativePath(
+    const std::wstring& relative_path,
+    bool allow_empty,
+    std::wstring* error_text) {
+  if (relative_path.empty()) {
+    if (allow_empty) {
+      return true;
+    }
+    if (error_text != nullptr) {
+      *error_text = L"file transfer path is empty";
+    }
+    return false;
+  }
+
+  const std::wstring normalized = NormalizePathSeparators(relative_path);
+  if (IsAbsoluteWindowsPath(normalized) ||
+      normalized[0] == L'\\' ||
+      normalized[0] == L'/') {
+    if (error_text != nullptr) {
+      *error_text = L"absolute file transfer paths are not allowed";
+    }
+    return false;
+  }
+  if (normalized.find(L':') != std::wstring::npos) {
+    if (error_text != nullptr) {
+      *error_text = L"drive-qualified file transfer paths are not allowed";
+    }
+    return false;
+  }
+
+  size_t start = 0;
+  while (start <= normalized.size()) {
+    const size_t end = normalized.find(L'\\', start);
+    const std::wstring part =
+        end == std::wstring::npos
+            ? normalized.substr(start)
+            : normalized.substr(start, end - start);
+    if (part.empty() || part == L"." || part == L"..") {
+      if (error_text != nullptr) {
+        *error_text = L"invalid file transfer path component";
+      }
+      return false;
+    }
+    if (end == std::wstring::npos) {
+      break;
+    }
+    start = end + 1;
+  }
+  return true;
+}
+
+bool ResolveFileTransferTargetPath(
+    const std::wstring& base_path,
+    const std::wstring& relative_name,
+    bool allow_empty_name,
+    std::wstring* resolved_path,
+    std::wstring* error_text) {
+  if (resolved_path == nullptr) {
+    return false;
+  }
+  resolved_path->clear();
+  if (!ValidateFileTransferRelativePath(relative_name, allow_empty_name, error_text)) {
+    return false;
+  }
+  *resolved_path = relative_name.empty()
+                       ? ResolveFileTransferFilesystemPath(base_path)
+                       : JoinWindowsPath(ResolveFileTransferFilesystemPath(base_path), relative_name);
+  return true;
+}
+
+bool IsFileTransferDriveRootPath(const std::wstring& path) {
+  const std::wstring normalized = NormalizePathSeparators(path);
+  return normalized.size() == 3 &&
+         std::iswalpha(normalized[0]) != 0 &&
+         normalized[1] == L':' &&
+         normalized[2] == L'\\';
+}
+
+bool IsFileTransferUncRootPath(const std::wstring& path) {
+  const std::wstring normalized = NormalizePathSeparators(path);
+  if (normalized.size() < 5 || normalized[0] != L'\\' || normalized[1] != L'\\') {
+    return false;
+  }
+  const size_t server_end = normalized.find(L'\\', 2);
+  if (server_end == std::wstring::npos) {
+    return false;
+  }
+  const size_t share_end = normalized.find(L'\\', server_end + 1);
+  return share_end == std::wstring::npos || share_end == normalized.size() - 1;
+}
+
+bool ResolveFileTransferMutablePath(
+    const std::wstring& requested_path,
+    std::wstring* resolved_path,
+    std::wstring* error_text) {
+  if (resolved_path == nullptr) {
+    return false;
+  }
+  *resolved_path = ResolveFileTransferFilesystemPath(requested_path);
+  if (resolved_path->empty()) {
+    if (error_text != nullptr) {
+      *error_text = L"file transfer path is empty";
+    }
+    return false;
+  }
+  if (*resolved_path == L"/") {
+    if (error_text != nullptr) {
+      *error_text = L"modifying the file-transfer root is not allowed";
+    }
+    return false;
+  }
+  if (!IsAbsoluteWindowsPath(*resolved_path)) {
+    if (error_text != nullptr) {
+      *error_text = L"absolute file transfer path required";
+    }
+    return false;
+  }
+  if (IsFileTransferDriveRootPath(*resolved_path)) {
+    if (error_text != nullptr) {
+      *error_text = L"modifying a drive root is not allowed";
+    }
+    return false;
+  }
+  if (IsFileTransferUncRootPath(*resolved_path)) {
+    if (error_text != nullptr) {
+      *error_text = L"modifying a network share root is not allowed";
+    }
+    return false;
+  }
+  return true;
+}
+
+bool TryRemoveReadOnlyAttribute(const std::wstring& path, DWORD attributes) {
+  if ((attributes & FILE_ATTRIBUTE_READONLY) == 0) {
+    return true;
+  }
+  return SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY) != FALSE;
+}
+
+bool RemoveFileTransferDirectoryTree(
+    const std::wstring& directory_path,
+    std::wstring* error_text) {
+  const DWORD attributes = GetFileAttributesW(directory_path.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    if (error_text != nullptr) {
+      *error_text = L"file transfer directory not found";
+    }
+    return false;
+  }
+  if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    if (error_text != nullptr) {
+      *error_text = L"file transfer path is not a directory";
+    }
+    return false;
+  }
+
+  if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+    TryRemoveReadOnlyAttribute(directory_path, attributes);
+    if (RemoveDirectoryW(directory_path.c_str()) != FALSE) {
+      return true;
+    }
+    if (error_text != nullptr) {
+      *error_text =
+          L"RemoveDirectoryW failed while removing directory link, error=" +
+          std::to_wstring(GetLastError());
+    }
+    return false;
+  }
+
+  std::wstring pattern = directory_path;
+  if (!pattern.empty() && pattern.back() != L'\\') {
+    pattern += L"\\";
+  }
+  pattern += L"*";
+
+  WIN32_FIND_DATAW find_data = {};
+  HANDLE find_handle = FindFirstFileW(pattern.c_str(), &find_data);
+  if (find_handle == INVALID_HANDLE_VALUE) {
+    const DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND) {
+      if (RemoveDirectoryW(directory_path.c_str()) != FALSE) {
+        return true;
+      }
+      if (error_text != nullptr) {
+        *error_text =
+            L"RemoveDirectoryW failed while removing empty directory, error=" +
+            std::to_wstring(GetLastError());
+      }
+      return false;
+    }
+    if (error_text != nullptr) {
+      *error_text =
+          L"FindFirstFileW failed while enumerating directory tree, error=" +
+          std::to_wstring(error);
+    }
+    return false;
+  }
+
+  bool success = true;
+  do {
+    const std::wstring name(find_data.cFileName);
+    if (name == L"." || name == L"..") {
+      continue;
+    }
+
+    const std::wstring entry_path = JoinWindowsPath(directory_path, name);
+    const DWORD entry_attributes = find_data.dwFileAttributes;
+    const bool is_directory = (entry_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    const bool is_link = (entry_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    TryRemoveReadOnlyAttribute(entry_path, entry_attributes);
+
+    if (is_directory && !is_link) {
+      if (!RemoveFileTransferDirectoryTree(entry_path, error_text)) {
+        success = false;
+        break;
+      }
+      continue;
+    }
+
+    const BOOL removed = is_directory
+                             ? RemoveDirectoryW(entry_path.c_str())
+                             : DeleteFileW(entry_path.c_str());
+    if (removed == FALSE) {
+      if (error_text != nullptr) {
+        *error_text =
+            std::wstring(is_directory ? L"RemoveDirectoryW failed, error="
+                                      : L"DeleteFileW failed, error=") +
+            std::to_wstring(GetLastError());
+      }
+      success = false;
+      break;
+    }
+  } while (FindNextFileW(find_handle, &find_data) != FALSE);
+
+  const DWORD iterate_error = GetLastError();
+  FindClose(find_handle);
+  if (!success) {
+    return false;
+  }
+  if (iterate_error != ERROR_NO_MORE_FILES) {
+    if (error_text != nullptr) {
+      *error_text =
+          L"FindNextFileW failed while enumerating directory tree, error=" +
+          std::to_wstring(iterate_error);
+    }
+    return false;
+  }
+
+  TryRemoveReadOnlyAttribute(directory_path, attributes);
+  if (RemoveDirectoryW(directory_path.c_str()) == FALSE) {
+    if (error_text != nullptr) {
+      *error_text =
+          L"RemoveDirectoryW failed while removing directory, error=" +
+          std::to_wstring(GetLastError());
+    }
+    return false;
+  }
+  return true;
+}
+
+bool BuildFileTransferEntryFromFindData(
+    const WIN32_FIND_DATAW& find_data,
+    const std::wstring& name,
+    FileTransferEntryData* entry) {
+  if (entry == nullptr) {
+    return false;
+  }
+  entry->name = name;
+  entry->is_hidden = (find_data.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0;
+  entry->modified_time = FileTimeToUnixSeconds(find_data.ftLastWriteTime);
+  const bool is_directory = (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  const bool is_link = (find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+  if (is_directory) {
+    entry->entry_type = static_cast<int>(
+        is_link ? FileTransferEntryType::kDirLink : FileTransferEntryType::kDir);
+    entry->size = 0;
+  } else {
+    entry->entry_type = static_cast<int>(
+        is_link ? FileTransferEntryType::kFileLink : FileTransferEntryType::kFile);
+    entry->size =
+        (static_cast<uint64_t>(find_data.nFileSizeHigh) << 32U) |
+        static_cast<uint64_t>(find_data.nFileSizeLow);
+  }
+  return true;
+}
+
+bool CollectFileTransferDirectoryEntries(
+    const std::wstring& requested_path,
+    bool include_hidden,
+    std::vector<FileTransferEntryData>* entries,
+    std::wstring* error_text) {
+  if (entries == nullptr) {
+    return false;
+  }
+  entries->clear();
+
+  const std::wstring resolved_path = ResolveFileTransferFilesystemPath(requested_path);
+  if (resolved_path == L"/") {
+    const DWORD drives = GetLogicalDrives();
+    for (int index = 0; index < 26; ++index) {
+      if ((drives & (1UL << index)) == 0) {
+        continue;
+      }
+      FileTransferEntryData drive;
+      drive.entry_type = static_cast<int>(FileTransferEntryType::kDirDrive);
+      drive.name = std::wstring(1, static_cast<wchar_t>(L'A' + index)) + L":";
+      entries->push_back(drive);
+    }
+    return true;
+  }
+
+  const DWORD attributes = GetFileAttributesW(resolved_path.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    if (error_text != nullptr) {
+      *error_text = L"file transfer path not found";
+    }
+    return false;
+  }
+  if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    if (error_text != nullptr) {
+      *error_text = L"file transfer path is not a directory";
+    }
+    return false;
+  }
+
+  std::wstring pattern = resolved_path;
+  if (!pattern.empty() && pattern.back() != L'\\') {
+    pattern += L"\\";
+  }
+  pattern += L"*";
+
+  WIN32_FIND_DATAW find_data = {};
+  HANDLE find_handle = FindFirstFileW(pattern.c_str(), &find_data);
+  if (find_handle == INVALID_HANDLE_VALUE) {
+    const DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND) {
+      return true;
+    }
+    if (error_text != nullptr) {
+      *error_text = L"FindFirstFileW failed for file transfer directory";
+    }
+    return false;
+  }
+
+  do {
+    const std::wstring name(find_data.cFileName);
+    if (name == L"." || name == L"..") {
+      continue;
+    }
+    FileTransferEntryData entry;
+    if (!BuildFileTransferEntryFromFindData(find_data, name, &entry)) {
+      continue;
+    }
+    if (entry.is_hidden && !include_hidden) {
+      continue;
+    }
+    entries->push_back(std::move(entry));
+  } while (FindNextFileW(find_handle, &find_data) != FALSE);
+
+  FindClose(find_handle);
+  return true;
+}
+
+bool CollectFileTransferRecursiveFilesInternal(
+    const std::wstring& current_path,
+    const std::wstring& relative_prefix,
+    bool include_hidden,
+    std::vector<FileTransferEntryData>* entries,
+    std::wstring* error_text) {
+  std::wstring pattern = current_path;
+  if (!pattern.empty() && pattern.back() != L'\\') {
+    pattern += L"\\";
+  }
+  pattern += L"*";
+
+  WIN32_FIND_DATAW find_data = {};
+  HANDLE find_handle = FindFirstFileW(pattern.c_str(), &find_data);
+  if (find_handle == INVALID_HANDLE_VALUE) {
+    const DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND) {
+      return true;
+    }
+    if (error_text != nullptr) {
+      *error_text = L"FindFirstFileW failed while collecting recursive file transfer entries";
+    }
+    return false;
+  }
+
+  do {
+    const std::wstring name(find_data.cFileName);
+    if (name == L"." || name == L"..") {
+      continue;
+    }
+
+    FileTransferEntryData entry;
+    if (!BuildFileTransferEntryFromFindData(find_data, name, &entry)) {
+      continue;
+    }
+    if (entry.is_hidden && !include_hidden) {
+      continue;
+    }
+
+    const bool is_directory =
+        entry.entry_type == static_cast<int>(FileTransferEntryType::kDir) ||
+        entry.entry_type == static_cast<int>(FileTransferEntryType::kDirLink);
+    const bool is_link =
+        entry.entry_type == static_cast<int>(FileTransferEntryType::kDirLink) ||
+        entry.entry_type == static_cast<int>(FileTransferEntryType::kFileLink);
+    const std::wstring child_relative =
+        relative_prefix.empty() ? name : JoinWindowsPath(relative_prefix, name);
+    const std::wstring child_path = JoinWindowsPath(current_path, name);
+
+    if (is_directory) {
+      if (is_link) {
+        continue;
+      }
+      if (!CollectFileTransferRecursiveFilesInternal(
+              child_path,
+              child_relative,
+              include_hidden,
+              entries,
+              error_text)) {
+        FindClose(find_handle);
+        return false;
+      }
+      continue;
+    }
+
+    if (is_link) {
+      continue;
+    }
+    entry.entry_type = static_cast<int>(FileTransferEntryType::kFile);
+    entry.name = child_relative;
+    entries->push_back(std::move(entry));
+  } while (FindNextFileW(find_handle, &find_data) != FALSE);
+
+  FindClose(find_handle);
+  return true;
+}
+
+bool CollectFileTransferRecursiveFiles(
+    const std::wstring& requested_path,
+    bool include_hidden,
+    std::vector<FileTransferEntryData>* entries,
+    std::wstring* error_text) {
+  if (entries == nullptr) {
+    return false;
+  }
+  entries->clear();
+
+  const std::wstring resolved_path = ResolveFileTransferFilesystemPath(requested_path);
+  const DWORD attributes = GetFileAttributesW(resolved_path.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    if (error_text != nullptr) {
+      *error_text = L"file transfer path not found";
+    }
+    return false;
+  }
+
+  if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    WIN32_FILE_ATTRIBUTE_DATA metadata = {};
+    if (!GetFileAttributesExW(
+            resolved_path.c_str(),
+            GetFileExInfoStandard,
+            &metadata)) {
+      if (error_text != nullptr) {
+        *error_text = L"GetFileAttributesExW failed for file transfer file";
+      }
+      return false;
+    }
+    FileTransferEntryData entry;
+    entry.entry_type = static_cast<int>(FileTransferEntryType::kFile);
+    entry.name.clear();
+    entry.is_hidden = (metadata.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0;
+    entry.size =
+        (static_cast<uint64_t>(metadata.nFileSizeHigh) << 32U) |
+        static_cast<uint64_t>(metadata.nFileSizeLow);
+    entry.modified_time = FileTimeToUnixSeconds(metadata.ftLastWriteTime);
+    entries->push_back(std::move(entry));
+    return true;
+  }
+
+  return CollectFileTransferRecursiveFilesInternal(
+      resolved_path,
+      std::wstring(),
+      include_hidden,
+      entries,
+      error_text);
+}
+
+void AppendFileTransferEntryPayload(
+    const FileTransferEntryData& entry,
+    std::vector<unsigned char>* out) {
+  std::vector<unsigned char> payload;
+  AppendVarintField(1U, static_cast<uint64_t>(entry.entry_type), &payload);
+  AppendStringField(2U, WideToUtf8(entry.name), &payload);
+  AppendVarintField(3U, entry.is_hidden ? 1U : 0U, &payload);
+  AppendVarintField(4U, entry.size, &payload);
+  AppendVarintField(5U, entry.modified_time, &payload);
+  AppendLengthDelimitedField(3U, payload, out);
+}
+
+std::vector<unsigned char> EncodeFileTransferDirectoryResponseMessage(
+    int id,
+    const std::wstring& path,
+    const std::vector<FileTransferEntryData>& entries) {
+  std::vector<unsigned char> dir;
+  AppendVarintField(1U, static_cast<uint64_t>(id), &dir);
+  AppendStringField(2U, WideToUtf8(path), &dir);
+  for (const FileTransferEntryData& entry : entries) {
+    AppendFileTransferEntryPayload(entry, &dir);
+  }
+
+  std::vector<unsigned char> response;
+  AppendLengthDelimitedField(1U, dir, &response);
+
+  std::vector<unsigned char> message;
+  AppendLengthDelimitedField(18U, response, &message);
+  return message;
+}
+
+std::vector<unsigned char> EncodeFileTransferBlockResponseMessage(
+    int id,
+    int file_num,
+    const std::vector<unsigned char>& data,
+    bool compressed,
+    unsigned int blk_id) {
+  std::vector<unsigned char> block;
+  AppendVarintField(1U, static_cast<uint64_t>(id), &block);
+  AppendSint32Field(2U, file_num, &block);
+  AppendBytesField(3U, data, &block);
+  AppendVarintField(4U, compressed ? 1U : 0U, &block);
+  AppendVarintField(5U, static_cast<uint64_t>(blk_id), &block);
+
+  std::vector<unsigned char> response;
+  AppendLengthDelimitedField(2U, block, &response);
+
+  std::vector<unsigned char> message;
+  AppendLengthDelimitedField(18U, response, &message);
+  return message;
+}
+
+std::vector<unsigned char> EncodeFileTransferErrorResponseMessage(
+    int id,
+    const std::wstring& error_text,
+    int file_num) {
+  std::vector<unsigned char> error;
+  AppendVarintField(1U, static_cast<uint64_t>(id), &error);
+  AppendStringField(2U, WideToUtf8(error_text), &error);
+  AppendSint32Field(3U, file_num, &error);
+
+  std::vector<unsigned char> response;
+  AppendLengthDelimitedField(3U, error, &response);
+
+  std::vector<unsigned char> message;
+  AppendLengthDelimitedField(18U, response, &message);
+  return message;
+}
+
+std::vector<unsigned char> EncodeFileTransferDoneResponseMessage(int id, int file_num) {
+  std::vector<unsigned char> done;
+  AppendVarintField(1U, static_cast<uint64_t>(id), &done);
+  AppendSint32Field(2U, file_num, &done);
+
+  std::vector<unsigned char> response;
+  AppendLengthDelimitedField(4U, done, &response);
+
+  std::vector<unsigned char> message;
+  AppendLengthDelimitedField(18U, response, &message);
+  return message;
+}
+
+std::vector<unsigned char> EncodeFileTransferDigestResponseMessage(
+    int id,
+    int file_num,
+    uint64_t last_modified,
+    uint64_t file_size,
+    bool is_upload,
+    bool is_identical,
+    uint64_t transferred_size,
+    bool is_resume) {
+  std::vector<unsigned char> digest;
+  AppendVarintField(1U, static_cast<uint64_t>(id), &digest);
+  AppendSint32Field(2U, file_num, &digest);
+  AppendVarintField(3U, last_modified, &digest);
+  AppendVarintField(4U, file_size, &digest);
+  AppendVarintField(5U, is_upload ? 1U : 0U, &digest);
+  AppendVarintField(6U, is_identical ? 1U : 0U, &digest);
+  AppendVarintField(7U, transferred_size, &digest);
+  AppendVarintField(8U, is_resume ? 1U : 0U, &digest);
+
+  std::vector<unsigned char> response;
+  AppendLengthDelimitedField(5U, digest, &response);
+
+  std::vector<unsigned char> message;
+  AppendLengthDelimitedField(18U, response, &message);
+  return message;
+}
+
+std::vector<unsigned char> EncodeFileTransferEmptyDirsResponseMessage(
+    const std::wstring& path) {
+  std::vector<unsigned char> empty_dirs;
+  AppendStringField(1U, WideToUtf8(path), &empty_dirs);
+
+  std::vector<unsigned char> response;
+  AppendLengthDelimitedField(6U, empty_dirs, &response);
+
+  std::vector<unsigned char> message;
+  AppendLengthDelimitedField(18U, response, &message);
+  return message;
+}
+
+std::vector<unsigned char> EncodeFileTransferSendConfirmActionMessage(
+    int id,
+    int file_num,
+    bool skip,
+    unsigned int offset_blk) {
+  std::vector<unsigned char> confirm;
+  AppendVarintField(1U, static_cast<uint64_t>(id), &confirm);
+  AppendSint32Field(2U, file_num, &confirm);
+  if (skip) {
+    AppendVarintField(3U, 1U, &confirm);
+  } else {
+    AppendVarintField(4U, static_cast<uint64_t>(offset_blk), &confirm);
+  }
+
+  std::vector<unsigned char> action;
+  AppendLengthDelimitedField(9U, confirm, &action);
+
+  std::vector<unsigned char> message;
+  AppendLengthDelimitedField(17U, action, &message);
+  return message;
+}
+
+bool ParseFileTransferEntryPayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferEntryData* entry) {
+  if (entry == nullptr) {
+    return false;
+  }
+  *entry = FileTransferEntryData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if ((field_number == 1U || field_number == 3U || field_number == 4U || field_number == 5U) &&
+        wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      switch (field_number) {
+        case 1U:
+          entry->entry_type = static_cast<int>(value);
+          break;
+        case 3U:
+          entry->is_hidden = value != 0;
+          break;
+        case 4U:
+          entry->size = value;
+          break;
+        case 5U:
+          entry->modified_time = value;
+          break;
+        default:
+          break;
+      }
+    } else if (field_number == 2U && wire_type == 2U) {
+      std::vector<unsigned char> value;
+      if (!ReadLengthDelimited(payload, &offset, &value)) {
+        return false;
+      }
+      entry->name = Utf8ToWide(std::string(value.begin(), value.end()));
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferReadDirPayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferReadDirData* read_dir) {
+  if (read_dir == nullptr) {
+    return false;
+  }
+  *read_dir = FileTransferReadDirData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if (field_number == 1U && wire_type == 2U) {
+      std::vector<unsigned char> value;
+      if (!ReadLengthDelimited(payload, &offset, &value)) {
+        return false;
+      }
+      read_dir->path = Utf8ToWide(std::string(value.begin(), value.end()));
+    } else if (field_number == 2U && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      read_dir->include_hidden = value != 0;
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferSendRequestPayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferSendRequestData* send_request) {
+  if (send_request == nullptr) {
+    return false;
+  }
+  *send_request = FileTransferSendRequestData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if ((field_number == 1U || field_number == 3U || field_number == 4U || field_number == 5U) &&
+        wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      switch (field_number) {
+        case 1U:
+          send_request->id = static_cast<int>(value);
+          break;
+        case 3U:
+          send_request->include_hidden = value != 0;
+          break;
+        case 4U:
+          send_request->file_num = static_cast<int>(value);
+          break;
+        case 5U:
+          send_request->file_type = static_cast<int>(value);
+          break;
+        default:
+          break;
+      }
+    } else if (field_number == 2U && wire_type == 2U) {
+      std::vector<unsigned char> value;
+      if (!ReadLengthDelimited(payload, &offset, &value)) {
+        return false;
+      }
+      send_request->path = Utf8ToWide(std::string(value.begin(), value.end()));
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferReceiveRequestPayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferReceiveRequestData* receive_request) {
+  if (receive_request == nullptr) {
+    return false;
+  }
+  *receive_request = FileTransferReceiveRequestData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if ((field_number == 1U || field_number == 4U || field_number == 5U) &&
+        wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      if (field_number == 1U) {
+        receive_request->id = static_cast<int>(value);
+      } else if (field_number == 4U) {
+        receive_request->file_num = static_cast<int>(value);
+      } else {
+        receive_request->total_size = value;
+      }
+    } else if (field_number == 2U && wire_type == 2U) {
+      std::vector<unsigned char> value;
+      if (!ReadLengthDelimited(payload, &offset, &value)) {
+        return false;
+      }
+      receive_request->path = Utf8ToWide(std::string(value.begin(), value.end()));
+    } else if (field_number == 3U && wire_type == 2U) {
+      std::vector<unsigned char> entry_payload;
+      if (!ReadLengthDelimited(payload, &offset, &entry_payload)) {
+        return false;
+      }
+      FileTransferEntryData entry;
+      if (!ParseFileTransferEntryPayload(entry_payload, &entry)) {
+        return false;
+      }
+      receive_request->files.push_back(std::move(entry));
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferCreateDirPayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferCreateDirData* create_dir) {
+  if (create_dir == nullptr) {
+    return false;
+  }
+  *create_dir = FileTransferCreateDirData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if (field_number == 1U && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      create_dir->id = static_cast<int>(value);
+    } else if (field_number == 2U && wire_type == 2U) {
+      std::vector<unsigned char> value;
+      if (!ReadLengthDelimited(payload, &offset, &value)) {
+        return false;
+      }
+      create_dir->path = Utf8ToWide(std::string(value.begin(), value.end()));
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferRemoveDirPayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferRemoveDirData* remove_dir) {
+  if (remove_dir == nullptr) {
+    return false;
+  }
+  *remove_dir = FileTransferRemoveDirData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if ((field_number == 1U || field_number == 3U) && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      if (field_number == 1U) {
+        remove_dir->id = static_cast<int>(value);
+      } else {
+        remove_dir->recursive = value != 0;
+      }
+    } else if (field_number == 2U && wire_type == 2U) {
+      std::vector<unsigned char> value;
+      if (!ReadLengthDelimited(payload, &offset, &value)) {
+        return false;
+      }
+      remove_dir->path = Utf8ToWide(std::string(value.begin(), value.end()));
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferRemoveFilePayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferRemoveFileData* remove_file) {
+  if (remove_file == nullptr) {
+    return false;
+  }
+  *remove_file = FileTransferRemoveFileData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if (field_number == 1U && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      remove_file->id = static_cast<int>(value);
+    } else if (field_number == 2U && wire_type == 2U) {
+      std::vector<unsigned char> value;
+      if (!ReadLengthDelimited(payload, &offset, &value)) {
+        return false;
+      }
+      remove_file->path = Utf8ToWide(std::string(value.begin(), value.end()));
+    } else if (field_number == 3U && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      remove_file->file_num = DecodeZigZag32(value);
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferCancelPayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferCancelData* cancel) {
+  if (cancel == nullptr) {
+    return false;
+  }
+  *cancel = FileTransferCancelData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if (field_number == 1U && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      cancel->id = static_cast<int>(value);
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferSendConfirmPayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferSendConfirmData* confirm) {
+  if (confirm == nullptr) {
+    return false;
+  }
+  *confirm = FileTransferSendConfirmData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if ((field_number == 1U || field_number == 3U || field_number == 4U) &&
+        wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      if (field_number == 1U) {
+        confirm->id = static_cast<int>(value);
+      } else if (field_number == 3U) {
+        confirm->has_skip = true;
+        confirm->skip = value != 0;
+      } else {
+        confirm->has_offset_blk = true;
+        confirm->offset_blk = static_cast<unsigned int>(value);
+      }
+    } else if (field_number == 2U && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      confirm->file_num = DecodeZigZag32(value);
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferRenamePayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferRenameData* rename) {
+  if (rename == nullptr) {
+    return false;
+  }
+  *rename = FileTransferRenameData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if (field_number == 1U && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      rename->id = static_cast<int>(value);
+    } else if ((field_number == 2U || field_number == 3U) && wire_type == 2U) {
+      std::vector<unsigned char> value;
+      if (!ReadLengthDelimited(payload, &offset, &value)) {
+        return false;
+      }
+      if (field_number == 2U) {
+        rename->path = Utf8ToWide(std::string(value.begin(), value.end()));
+      } else {
+        rename->new_name = Utf8ToWide(std::string(value.begin(), value.end()));
+      }
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferReadAllFilesPayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferReadAllFilesData* all_files) {
+  if (all_files == nullptr) {
+    return false;
+  }
+  *all_files = FileTransferReadAllFilesData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if ((field_number == 1U || field_number == 3U) && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      if (field_number == 1U) {
+        all_files->id = static_cast<int>(value);
+      } else {
+        all_files->include_hidden = value != 0;
+      }
+    } else if (field_number == 2U && wire_type == 2U) {
+      std::vector<unsigned char> value;
+      if (!ReadLengthDelimited(payload, &offset, &value)) {
+        return false;
+      }
+      all_files->path = Utf8ToWide(std::string(value.begin(), value.end()));
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferActionMessage(
+    const std::vector<unsigned char>& frame,
+    FileTransferActionData* action) {
+  if (action == nullptr) {
+    return false;
+  }
+  *action = FileTransferActionData();
+  size_t offset = 0;
+  while (offset < frame.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(frame, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if (field_number != 17U || wire_type != 2U) {
+      if (!SkipField(wire_type, frame, &offset)) {
+        return false;
+      }
+      continue;
+    }
+
+    std::vector<unsigned char> payload;
+    if (!ReadLengthDelimited(frame, &offset, &payload)) {
+      return false;
+    }
+
+    size_t payload_offset = 0;
+    while (payload_offset < payload.size()) {
+      uint64_t subtag = 0;
+      if (!ReadVarint(payload, &payload_offset, &subtag)) {
+        return false;
+      }
+      const unsigned int subfield_number = static_cast<unsigned int>(subtag >> 3U);
+      const unsigned int subwire_type = static_cast<unsigned int>(subtag & 0x07U);
+      if (subwire_type != 2U) {
+        if (!SkipField(subwire_type, payload, &payload_offset)) {
+          return false;
+        }
+        continue;
+      }
+
+      std::vector<unsigned char> value;
+      if (!ReadLengthDelimited(payload, &payload_offset, &value)) {
+        return false;
+      }
+
+      switch (subfield_number) {
+        case 1U:
+          action->kind = FileTransferActionKind::kReadDir;
+          return ParseFileTransferReadDirPayload(value, &action->read_dir);
+        case 2U:
+          action->kind = FileTransferActionKind::kSend;
+          return ParseFileTransferSendRequestPayload(value, &action->send);
+        case 3U:
+          action->kind = FileTransferActionKind::kReceive;
+          return ParseFileTransferReceiveRequestPayload(value, &action->receive);
+        case 4U:
+          action->kind = FileTransferActionKind::kCreate;
+          return ParseFileTransferCreateDirPayload(value, &action->create);
+        case 5U:
+          action->kind = FileTransferActionKind::kRemoveDir;
+          return ParseFileTransferRemoveDirPayload(value, &action->remove_dir);
+        case 6U:
+          action->kind = FileTransferActionKind::kRemoveFile;
+          return ParseFileTransferRemoveFilePayload(value, &action->remove_file);
+        case 7U:
+          action->kind = FileTransferActionKind::kAllFiles;
+          return ParseFileTransferReadAllFilesPayload(value, &action->all_files);
+        case 8U:
+          action->kind = FileTransferActionKind::kCancel;
+          return ParseFileTransferCancelPayload(value, &action->cancel);
+        case 9U:
+          action->kind = FileTransferActionKind::kSendConfirm;
+          return ParseFileTransferSendConfirmPayload(value, &action->send_confirm);
+        case 10U:
+          action->kind = FileTransferActionKind::kRename;
+          return ParseFileTransferRenamePayload(value, &action->rename);
+        case 11U:
+          action->kind = FileTransferActionKind::kReadEmptyDirs;
+          return ParseFileTransferReadDirPayload(value, &action->read_dir);
+        default:
+          break;
+      }
+    }
+    return action->kind != FileTransferActionKind::kNone;
+  }
+  return false;
+}
+
+bool ParseFileTransferBlockPayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferBlockData* block) {
+  if (block == nullptr) {
+    return false;
+  }
+  *block = FileTransferBlockData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if ((field_number == 1U || field_number == 4U || field_number == 5U) &&
+        wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      if (field_number == 1U) {
+        block->id = static_cast<int>(value);
+      } else if (field_number == 4U) {
+        block->compressed = value != 0;
+      } else {
+        block->blk_id = static_cast<unsigned int>(value);
+      }
+    } else if (field_number == 2U && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      block->file_num = DecodeZigZag32(value);
+    } else if (field_number == 3U && wire_type == 2U) {
+      if (!ReadLengthDelimited(payload, &offset, &block->data)) {
+        return false;
+      }
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferDonePayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferDoneData* done) {
+  if (done == nullptr) {
+    return false;
+  }
+  *done = FileTransferDoneData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if (field_number == 1U && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      done->id = static_cast<int>(value);
+    } else if (field_number == 2U && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      done->file_num = DecodeZigZag32(value);
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferDigestPayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferDigestData* digest) {
+  if (digest == nullptr) {
+    return false;
+  }
+  *digest = FileTransferDigestData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if (wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      switch (field_number) {
+        case 1U:
+          digest->id = static_cast<int>(value);
+          break;
+        case 2U:
+          digest->file_num = DecodeZigZag32(value);
+          break;
+        case 3U:
+          digest->last_modified = value;
+          break;
+        case 4U:
+          digest->file_size = value;
+          break;
+        case 5U:
+          digest->is_upload = value != 0;
+          break;
+        case 6U:
+          digest->is_identical = value != 0;
+          break;
+        case 7U:
+          digest->transferred_size = value;
+          break;
+        case 8U:
+          digest->is_resume = value != 0;
+          break;
+        default:
+          break;
+      }
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferErrorPayload(
+    const std::vector<unsigned char>& payload,
+    FileTransferErrorData* error) {
+  if (error == nullptr) {
+    return false;
+  }
+  *error = FileTransferErrorData();
+  size_t offset = 0;
+  while (offset < payload.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(payload, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if (field_number == 1U && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      error->id = static_cast<int>(value);
+    } else if (field_number == 2U && wire_type == 2U) {
+      std::vector<unsigned char> value;
+      if (!ReadLengthDelimited(payload, &offset, &value)) {
+        return false;
+      }
+      error->error = Utf8ToWide(std::string(value.begin(), value.end()));
+    } else if (field_number == 3U && wire_type == 0U) {
+      uint64_t value = 0;
+      if (!ReadVarint(payload, &offset, &value)) {
+        return false;
+      }
+      error->file_num = DecodeZigZag32(value);
+    } else if (!SkipField(wire_type, payload, &offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseFileTransferResponseMessage(
+    const std::vector<unsigned char>& frame,
+    FileTransferResponseData* response) {
+  if (response == nullptr) {
+    return false;
+  }
+  *response = FileTransferResponseData();
+  size_t offset = 0;
+  while (offset < frame.size()) {
+    uint64_t tag = 0;
+    if (!ReadVarint(frame, &offset, &tag)) {
+      return false;
+    }
+    const unsigned int field_number = static_cast<unsigned int>(tag >> 3U);
+    const unsigned int wire_type = static_cast<unsigned int>(tag & 0x07U);
+    if (field_number != 18U || wire_type != 2U) {
+      if (!SkipField(wire_type, frame, &offset)) {
+        return false;
+      }
+      continue;
+    }
+
+    std::vector<unsigned char> payload;
+    if (!ReadLengthDelimited(frame, &offset, &payload)) {
+      return false;
+    }
+
+    size_t payload_offset = 0;
+    while (payload_offset < payload.size()) {
+      uint64_t subtag = 0;
+      if (!ReadVarint(payload, &payload_offset, &subtag)) {
+        return false;
+      }
+      const unsigned int subfield_number = static_cast<unsigned int>(subtag >> 3U);
+      const unsigned int subwire_type = static_cast<unsigned int>(subtag & 0x07U);
+      if (subwire_type != 2U) {
+        if (!SkipField(subwire_type, payload, &payload_offset)) {
+          return false;
+        }
+        continue;
+      }
+
+      std::vector<unsigned char> value;
+      if (!ReadLengthDelimited(payload, &payload_offset, &value)) {
+        return false;
+      }
+
+      switch (subfield_number) {
+        case 1U: {
+          response->kind = FileTransferResponseKind::kDir;
+          size_t dir_offset = 0;
+          while (dir_offset < value.size()) {
+            uint64_t dir_tag = 0;
+            if (!ReadVarint(value, &dir_offset, &dir_tag)) {
+              return false;
+            }
+            const unsigned int dir_field_number = static_cast<unsigned int>(dir_tag >> 3U);
+            const unsigned int dir_wire_type = static_cast<unsigned int>(dir_tag & 0x07U);
+            if (dir_field_number == 1U && dir_wire_type == 0U) {
+              uint64_t dir_id = 0;
+              if (!ReadVarint(value, &dir_offset, &dir_id)) {
+                return false;
+              }
+              response->dir_id = static_cast<int>(dir_id);
+            } else if (dir_field_number == 2U && dir_wire_type == 2U) {
+              std::vector<unsigned char> path_bytes;
+              if (!ReadLengthDelimited(value, &dir_offset, &path_bytes)) {
+                return false;
+              }
+              response->dir_path = Utf8ToWide(std::string(path_bytes.begin(), path_bytes.end()));
+            } else if (dir_field_number == 3U && dir_wire_type == 2U) {
+              std::vector<unsigned char> entry_payload;
+              if (!ReadLengthDelimited(value, &dir_offset, &entry_payload)) {
+                return false;
+              }
+              FileTransferEntryData entry;
+              if (!ParseFileTransferEntryPayload(entry_payload, &entry)) {
+                return false;
+              }
+              response->dir_entries.push_back(std::move(entry));
+            } else if (!SkipField(dir_wire_type, value, &dir_offset)) {
+              return false;
+            }
+          }
+          return true;
+        }
+        case 2U:
+          response->kind = FileTransferResponseKind::kBlock;
+          return ParseFileTransferBlockPayload(value, &response->block);
+        case 3U:
+          response->kind = FileTransferResponseKind::kError;
+          return ParseFileTransferErrorPayload(value, &response->error);
+        case 4U:
+          response->kind = FileTransferResponseKind::kDone;
+          return ParseFileTransferDonePayload(value, &response->done);
+        case 5U:
+          response->kind = FileTransferResponseKind::kDigest;
+          return ParseFileTransferDigestPayload(value, &response->digest);
+        case 6U: {
+          response->kind = FileTransferResponseKind::kEmptyDirs;
+          FileTransferReadDirData parsed;
+          if (!ParseFileTransferReadDirPayload(value, &parsed)) {
+            return false;
+          }
+          response->empty_dirs_path = parsed.path;
+          return true;
+        }
+        default:
+          break;
+      }
+    }
+    return response->kind != FileTransferResponseKind::kNone;
+  }
+  return false;
+}
+
+bool OpenFileTransferReadHandle(FileTransferReadJob* job, std::wstring* error_text) {
+  if (job == nullptr) {
+    return false;
+  }
+  if (job->file != INVALID_HANDLE_VALUE) {
+    return true;
+  }
+  if (job->file_num < 0 || job->file_num >= static_cast<int>(job->files.size())) {
+    if (error_text != nullptr) {
+      *error_text = L"file transfer read index out of range";
+    }
+    return false;
+  }
+
+  const FileTransferEntryData& entry = job->files[job->file_num];
+  const std::wstring path =
+      entry.name.empty() ? job->source_path : JoinWindowsPath(job->source_path, entry.name);
+  job->file = CreateFileW(
+      path.c_str(),
+      GENERIC_READ,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (job->file == INVALID_HANDLE_VALUE) {
+    if (error_text != nullptr) {
+      *error_text = L"CreateFileW failed while opening file transfer source";
+    }
+    return false;
+  }
+
+  if (job->resume_offset > 0) {
+    LARGE_INTEGER position = {};
+    position.QuadPart = static_cast<LONGLONG>(job->resume_offset);
+    if (!SetFilePointerEx(job->file, position, nullptr, FILE_BEGIN)) {
+      if (error_text != nullptr) {
+        *error_text = L"SetFilePointerEx failed while resuming file transfer";
+      }
+      CloseFileTransferHandle(&job->file);
+      return false;
+    }
+  }
+  return true;
+}
+
+void ResetFileTransferReadJobCurrentFile(FileTransferReadJob* job) {
+  if (job == nullptr) {
+    return;
+  }
+  CloseFileTransferHandle(&job->file);
+  job->sent_digest = false;
+  job->waiting_for_confirm = false;
+  job->file_confirmed = false;
+  job->resume_offset = 0;
+}
+
+void AdvanceFileTransferReadJob(FileTransferReadJob* job) {
+  if (job == nullptr) {
+    return;
+  }
+  ResetFileTransferReadJobCurrentFile(job);
+  ++job->file_num;
+}
+
+bool IsFileTransferReadJobComplete(const FileTransferReadJob& job) {
+  return job.file_num >= static_cast<int>(job.files.size());
+}
+
+void DiscardFileTransferWriteCurrentFile(FileTransferWriteJob* job) {
+  if (job == nullptr) {
+    return;
+  }
+  CloseFileTransferHandle(&job->file);
+  if (!job->current_temp_path.empty()) {
+    DeleteFileW(job->current_temp_path.c_str());
+  }
+  job->current_file_num = -1;
+  job->current_temp_path.clear();
+  job->current_final_path.clear();
+}
+
+bool FinalizeFileTransferWriteCurrentFile(
+    FileTransferWriteJob* job,
+    std::wstring* error_text) {
+  if (job == nullptr) {
+    return false;
+  }
+  if (job->current_file_num < 0) {
+    return true;
+  }
+
+  CloseFileTransferHandle(&job->file);
+  const std::wstring temp_path = job->current_temp_path;
+  const std::wstring final_path = job->current_final_path;
+  const int file_index = job->current_file_num;
+
+  job->current_file_num = -1;
+  job->current_temp_path.clear();
+  job->current_final_path.clear();
+
+  if (temp_path.empty() || final_path.empty()) {
+    return true;
+  }
+
+  if (!MoveFileExW(
+          temp_path.c_str(),
+          final_path.c_str(),
+          MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+    if (error_text != nullptr) {
+      *error_text = L"MoveFileExW failed while finalizing file transfer target";
+    }
+    return false;
+  }
+  if (file_index >= 0 && file_index < static_cast<int>(job->files.size())) {
+    ApplyFileTransferModifiedTime(final_path, job->files[file_index].modified_time);
+  }
+  return true;
+}
+
+bool PrepareFileTransferWriteTarget(
+    FileTransferWriteJob* job,
+    int file_num,
+    std::wstring* error_text) {
+  if (job == nullptr) {
+    return false;
+  }
+  if (file_num < 0 || file_num >= static_cast<int>(job->files.size())) {
+    if (error_text != nullptr) {
+      *error_text = L"file transfer write index out of range";
+    }
+    return false;
+  }
+  if (job->current_file_num == file_num && job->file != INVALID_HANDLE_VALUE) {
+    return true;
+  }
+  if (job->current_file_num != -1 && job->current_file_num != file_num) {
+    if (!FinalizeFileTransferWriteCurrentFile(job, error_text)) {
+      return false;
+    }
+  }
+
+  const FileTransferEntryData& entry = job->files[file_num];
+  std::wstring final_path;
+  if (!ResolveFileTransferTargetPath(
+          job->target_path,
+          entry.name,
+          job->files.size() == 1 && entry.name.empty(),
+          &final_path,
+          error_text)) {
+    return false;
+  }
+  const std::wstring parent_directory = GetDirectoryPathPart(final_path);
+  if (!parent_directory.empty() &&
+      !EnsureDirectoryExistsRecursive(parent_directory, error_text)) {
+    return false;
+  }
+
+  const std::wstring temp_path = final_path + L".download";
+  DeleteFileW(temp_path.c_str());
+  job->file = CreateFileW(
+      temp_path.c_str(),
+      GENERIC_WRITE,
+      FILE_SHARE_READ,
+      nullptr,
+      CREATE_ALWAYS,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (job->file == INVALID_HANDLE_VALUE) {
+    if (error_text != nullptr) {
+      *error_text = L"CreateFileW failed while opening file transfer target";
+    }
+    return false;
+  }
+
+  job->current_file_num = file_num;
+  job->current_temp_path = temp_path;
+  job->current_final_path = final_path;
+  return true;
 }
 
 bool FrameContainsMessageField(const std::vector<unsigned char>& frame, unsigned int wanted_field) {
@@ -7849,9 +10083,13 @@ std::wstring RegisterPkResultText(int result) {
 
 }  // namespace
 
-PortableHostApp::PortableHostApp() = default;
+PortableHostApp::PortableHostApp() {
+  ResetPortableHostLog();
+  AppendPortableHostLog(L"app", L"========== PortableHostApp start ==========");
+}
 
 PortableHostApp::~PortableHostApp() {
+  AppendPortableHostLog(L"app", L"========== PortableHostApp shutdown ==========");
   StopRendezvousWorker();
   DestroyIncomingApprovalWindow();
   RemoveTrayIcon();
@@ -7923,6 +10161,14 @@ bool PortableHostApp::Initialize(HINSTANCE instance) {
   button_brush_ = CreateSolidBrush(kAccentColor);
 
   LoadOrCreateConfig();
+  AppendPortableHostLog(
+      L"app",
+      L"Initialize config: exe_dir=" + config_.exe_dir +
+          L", config_path=" + config_.config_path +
+          L", id_server=" + config_.id_server +
+          L", relay_server=" + config_.relay_server +
+          L", direct_access_enabled=" + BoolToLogText(config_.direct_access_enabled) +
+          L", direct_access_port=" + std::to_wstring(config_.direct_access_port));
   RefreshPassword();
   RefreshServerState();
   StartRendezvousWorker();
@@ -8023,6 +10269,10 @@ LRESULT PortableHostApp::WindowProc(HWND hwnd, UINT message, WPARAM w_param, LPA
       }
       if (control_id == kOptionsMenuLanguage) {
         ConfigureLanguage();
+        return 0;
+      }
+      if (control_id == kOptionsMenuAbout) {
+        ShowAboutDialog();
         return 0;
       }
       break;
@@ -10396,6 +12646,11 @@ void PortableHostApp::ShowOptionsMenu() {
       MF_STRING,
       kOptionsMenuLanguage,
       GetText(L"menu_language", L"\u8a9e\u8a00").c_str());
+  AppendMenuW(
+      options_menu,
+      MF_STRING,
+      kOptionsMenuAbout,
+      GetText(L"menu_about", L"\u95dc\u65bc").c_str());
 
   RECT button_rect = {};
   GetWindowRect(options_button_, &button_rect);
@@ -10569,12 +12824,52 @@ void PortableHostApp::ConfigureLanguage() {
   }
 }
 
+void PortableHostApp::ShowAboutDialog() const {
+  const std::wstring dialog_title = GetText(L"menu_about", L"\u95dc\u65bc");
+  const std::wstring about_text = language_base_is_traditional_
+      ? std::wstring(kAppWindowTitle) +
+            L"\r\n\u7248\u672c\uff1a" + kAboutDisplayVersion +
+            L"\r\n\r\n"
+            L"\u8f15\u91cf\u5316 RustDesk \u76f8\u5bb9 Host-only \u88ab\u63a7\u7aef\u5de5\u5177\r\n"
+            L"\u652f\u63f4 Windows XP / 7 / 10 / 11 \u8207 WinPE \u74b0\u5883\r\n\r\n"
+            L"Copyright \u00A9 2025-2026 Terence0816\r\n\r\n"
+            L"\u6388\u6b0a\uff1aGPL-3.0\r\n"
+            L"\u5c08\u6848\u7db2\u5740\uff1a\r\n" +
+            std::wstring(kProjectUrl) + L"\r\n\r\n" +
+            L"\u672c\u5c08\u6848\u70ba\u7368\u7acb\u958b\u767c\u7684 RustDesk \u76f8\u5bb9\u5be6\u4f5c\uff0c\r\n"
+            L"\u4e26\u975e RustDesk \u5b98\u65b9\u7528\u6236\u7aef\u3002"
+      : std::wstring(kAppWindowTitle) +
+            L"\r\nVersion " + kAboutDisplayVersion +
+            L"\r\n\r\n"
+            L"A lightweight RustDesk-compatible host-only client for Windows XP / 7 / 10 / 11 and WinPE.\r\n\r\n"
+            L"Copyright \u00A9 2025-2026 Terence0816\r\n\r\n"
+            L"License: GPL-3.0\r\n"
+            L"Project:\r\n" +
+            std::wstring(kProjectUrl) + L"\r\n\r\n" +
+            L"This project is an independent RustDesk-compatible implementation.\r\n"
+            L"It is not an official RustDesk client.";
+  ShowAboutDialogModal(
+      instance_,
+      window_,
+      font_body_ != nullptr ? font_body_ : font_button_,
+      window_icon_small_ != nullptr ? window_icon_small_ : window_icon_large_,
+      dialog_title,
+      about_text,
+      GetText(L"dialog_ok", L"\u78ba\u5b9a"),
+      GetText(L"button_check_updates", L"\u6aa2\u67e5\u66f4\u65b0"),
+      GetText(L"msg_open_project_failed", L"\u7121\u6cd5\u958b\u555f\u5c08\u6848\u7db2\u5740\u3002"),
+      kProjectUrl);
+}
+
 void PortableHostApp::StartRendezvousWorker() {
+  AppendPortableHostLog(L"session", L"StartRendezvousWorker requested");
   StopRendezvousWorker();
   stop_rendezvous_.store(false);
   stop_active_session_.store(false);
+  stop_auxiliary_session_.store(false);
   active_session_manual_close_requested_.store(false);
   active_session_running_.store(false);
+  auxiliary_session_running_.store(false);
   active_session_connected_.store(false);
   active_session_generation_.store(0);
   {
@@ -10587,15 +12882,24 @@ void PortableHostApp::StartRendezvousWorker() {
     pending_session_requested_ = false;
     pending_session_generation_ = 0;
   }
+  {
+    Win32LockGuard guard(auxiliary_session_mutex_);
+    auxiliary_session_connection_ = nullptr;
+  }
   ClearActiveSessionIdentity();
   if (!rendezvous_thread_.Start([this]() { RendezvousWorker(); })) {
+    AppendPortableHostLog(L"session", L"failed to start rendezvous worker thread");
     SetRendezvousStatus(L"failed to start rendezvous worker thread", false);
+  } else {
+    AppendPortableHostLog(L"session", L"rendezvous worker thread started");
   }
 }
 
 void PortableHostApp::StopRendezvousWorker() {
+  AppendPortableHostLog(L"session", L"StopRendezvousWorker requested");
   stop_rendezvous_.store(true);
   StopActiveSession();
+  StopAuxiliarySession();
   {
     Win32LockGuard guard(active_session_mutex_);
     pending_session_runner_ = std::function<bool(std::wstring*)>();
@@ -10614,13 +12918,20 @@ void PortableHostApp::StopRendezvousWorker() {
   if (rendezvous_thread_.Joinable()) {
     rendezvous_thread_.Join();
   }
+  AppendPortableHostLog(L"session", L"StopRendezvousWorker completed");
 }
 
 void PortableHostApp::StopActiveSession(bool notify_peer) {
+  AppendPortableHostLog(
+      L"session",
+      L"StopActiveSession notify_peer=" + BoolToLogText(notify_peer) +
+          L", active_running=" + BoolToLogText(active_session_running_.load()) +
+          L", active_connected=" + BoolToLogText(active_session_connected_.load()));
   stop_active_session_.store(true);
   active_session_manual_close_requested_.store(notify_peer);
   active_session_connected_.store(false);
   ClearActiveSessionIdentity();
+  StopAuxiliarySession();
 
   if (notify_peer) {
     return;
@@ -10632,11 +12943,48 @@ void PortableHostApp::StopActiveSession(bool notify_peer) {
     connection = reinterpret_cast<TcpFramedConnection*>(active_session_connection_);
   }
   if (connection != nullptr) {
+    AppendPortableHostLog(L"session", L"aborting active session connection");
     connection->Abort();
   }
 }
 
+void PortableHostApp::StopAuxiliarySession() {
+  const bool was_running = auxiliary_session_running_.load();
+  if (!was_running) {
+    Win32LockGuard thread_guard(auxiliary_session_thread_mutex_);
+    if (!auxiliary_session_thread_.Joinable()) {
+      return;
+    }
+  }
+
+  AppendPortableHostLog(
+      L"session",
+      L"StopAuxiliarySession requested, running=" +
+          BoolToLogText(was_running));
+  stop_auxiliary_session_.store(true);
+
+  TcpFramedConnection* connection = nullptr;
+  {
+    Win32LockGuard guard(auxiliary_session_mutex_);
+    connection = reinterpret_cast<TcpFramedConnection*>(auxiliary_session_connection_);
+  }
+  if (connection != nullptr) {
+    AppendPortableHostLog(L"session", L"aborting auxiliary session connection");
+    connection->Abort();
+  }
+
+  {
+    Win32LockGuard thread_guard(auxiliary_session_thread_mutex_);
+    if (auxiliary_session_thread_.Joinable()) {
+      auxiliary_session_thread_.Join();
+    }
+  }
+  auxiliary_session_running_.store(false);
+  ClearAuxiliarySessionConnection(nullptr);
+}
+
 void PortableHostApp::ActiveSessionWorker() {
+  AppendPortableHostLog(L"session", L"ActiveSessionWorker started");
   while (!stop_rendezvous_.load()) {
     std::function<bool(std::wstring*)> runner;
     std::wstring starting_status;
@@ -10670,8 +13018,18 @@ void PortableHostApp::ActiveSessionWorker() {
       SetRendezvousStatus(starting_status, registered);
     }
 
+    AppendPortableHostLog(
+        L"session",
+        L"runner starting generation=" + std::to_wstring(generation) +
+            L", registered=" + BoolToLogText(registered) +
+            L", starting_status=" + starting_status);
     std::wstring session_status;
     const bool session_ok = runner(&session_status);
+    AppendPortableHostLog(
+        L"session",
+        L"runner finished generation=" + std::to_wstring(generation) +
+            L", ok=" + BoolToLogText(session_ok) +
+            L", status=" + session_status);
 
     active_session_running_.store(false);
     active_session_connected_.store(false);
@@ -10698,6 +13056,7 @@ void PortableHostApp::ActiveSessionWorker() {
       }
     }
   }
+  AppendPortableHostLog(L"session", L"ActiveSessionWorker exited");
 }
 
 void PortableHostApp::SetRendezvousStatus(const std::wstring& text, bool registered) {
@@ -10729,6 +13088,15 @@ bool PortableHostApp::IsActiveSessionStopRequested() const {
   return stop_rendezvous_.load() || stop_active_session_.load();
 }
 
+bool PortableHostApp::HasAuxiliarySession() const {
+  return auxiliary_session_running_.load();
+}
+
+bool PortableHostApp::IsAuxiliarySessionStopRequested() const {
+  return stop_rendezvous_.load() || stop_active_session_.load() ||
+         stop_auxiliary_session_.load();
+}
+
 void PortableHostApp::RegisterActiveSessionConnection(void* connection) {
   Win32LockGuard guard(active_session_mutex_);
   active_session_connection_ = connection;
@@ -10741,6 +13109,18 @@ void PortableHostApp::ClearActiveSessionConnection(void* connection) {
   }
 }
 
+void PortableHostApp::RegisterAuxiliarySessionConnection(void* connection) {
+  Win32LockGuard guard(auxiliary_session_mutex_);
+  auxiliary_session_connection_ = connection;
+}
+
+void PortableHostApp::ClearAuxiliarySessionConnection(void* connection) {
+  Win32LockGuard guard(auxiliary_session_mutex_);
+  if (connection == nullptr || auxiliary_session_connection_ == connection) {
+    auxiliary_session_connection_ = nullptr;
+  }
+}
+
 bool PortableHostApp::StartActiveSessionThread(
     const std::wstring& starting_status,
     bool registered,
@@ -10749,6 +13129,19 @@ bool PortableHostApp::StartActiveSessionThread(
   if (!runner) {
     return false;
   }
+
+  const bool had_active_session = active_session_running_.load();
+  bool had_pending_session = false;
+  {
+    Win32LockGuard guard(active_session_mutex_);
+    had_pending_session = pending_session_requested_;
+  }
+  AppendPortableHostLog(
+      L"session",
+      L"StartActiveSessionThread starting_status=" + starting_status +
+          L", registered=" + BoolToLogText(registered) +
+          L", had_active_session=" + BoolToLogText(had_active_session) +
+          L", had_pending_session=" + BoolToLogText(had_pending_session));
 
   const unsigned long generation = active_session_generation_.fetch_add(1) + 1;
   {
@@ -10774,8 +13167,71 @@ bool PortableHostApp::StartActiveSessionThread(
     pending_session_requested_ = false;
     pending_session_generation_ = 0;
     SetRendezvousStatus(L"failed to start active session worker thread", registered);
+    AppendPortableHostLog(L"session", L"failed to start active session worker thread");
     return false;
   }
+  AppendPortableHostLog(
+      L"session",
+      L"StartActiveSessionThread queued generation=" + std::to_wstring(generation));
+  return true;
+}
+
+bool PortableHostApp::StartAuxiliarySessionThread(
+    const std::wstring& starting_status,
+    bool registered,
+    const std::wstring& failure_prefix,
+    std::function<bool(std::wstring*)> runner) {
+  if (!runner) {
+    return false;
+  }
+
+  if (HasAuxiliarySession()) {
+    AppendPortableHostLog(
+        L"session",
+        L"auxiliary session already running; ignoring new request: " + starting_status);
+    return true;
+  }
+
+  AppendPortableHostLog(
+      L"session",
+      L"StartAuxiliarySessionThread starting_status=" + starting_status +
+          L", registered=" + BoolToLogText(registered));
+  StopAuxiliarySession();
+  stop_auxiliary_session_.store(false);
+  auxiliary_session_running_.store(true);
+
+  Win32LockGuard guard(auxiliary_session_thread_mutex_);
+  if (!auxiliary_session_thread_.Start(
+          [this, starting_status, registered, failure_prefix, runner = std::move(runner)]() mutable {
+            AppendPortableHostLog(
+                L"session",
+                L"auxiliary runner starting, registered=" +
+                    BoolToLogText(registered) +
+                    L", starting_status=" + starting_status);
+            std::wstring session_status;
+            const bool session_ok = runner(&session_status);
+            AppendPortableHostLog(
+                L"session",
+                L"auxiliary runner finished, ok=" + BoolToLogText(session_ok) +
+                    L", status=" + session_status);
+            auxiliary_session_running_.store(false);
+            ClearAuxiliarySessionConnection(nullptr);
+            if (!stop_rendezvous_.load() &&
+                !stop_active_session_.load() &&
+                !stop_auxiliary_session_.load() &&
+                !session_ok) {
+              SetRendezvousStatus(
+                  failure_prefix + (session_status.empty() ? L"unknown auxiliary session error"
+                                                           : session_status),
+                  registered);
+            }
+          })) {
+    auxiliary_session_running_.store(false);
+    ClearAuxiliarySessionConnection(nullptr);
+    AppendPortableHostLog(L"session", L"failed to start auxiliary session worker thread");
+    return false;
+  }
+  AppendPortableHostLog(L"session", L"auxiliary session thread started");
   return true;
 }
 
@@ -11335,6 +13791,52 @@ void PortableHostApp::RendezvousWorker() {
       }
     };
 
+    auto should_auto_accept_secondary_file_transfer =
+        [this](const LoginRequestData& login_request,
+               const std::wstring& display_remote_id_override) -> bool {
+      bool accepted = false;
+      std::wstring reason = L"not a secondary file-transfer request";
+      std::wstring expected_remote_id;
+      std::wstring active_remote_id;
+      if (!login_request.has_file_transfer) {
+        reason = L"login_request.has_file_transfer=false";
+      } else if (!login_request.password.empty()) {
+        reason = L"login_request.password is not empty";
+      } else if (!active_session_connected_.load()) {
+        reason = L"active_session_connected=false";
+      } else {
+        expected_remote_id = Trim(
+            display_remote_id_override.empty()
+                ? login_request.my_id
+                : display_remote_id_override);
+        if (expected_remote_id.empty()) {
+          reason = L"expected_remote_id is empty";
+        } else {
+          {
+            Win32LockGuard guard(active_session_mutex_);
+            active_remote_id = Trim(active_session_remote_id_);
+          }
+          accepted = !active_remote_id.empty() &&
+                     _wcsicmp(active_remote_id.c_str(), expected_remote_id.c_str()) == 0;
+          reason = accepted ? L"matched active remote id" : L"active remote id mismatch";
+        }
+      }
+      AppendPortableHostLog(
+          L"file-transfer",
+          L"secondary auto-accept check: result=" + BoolToLogText(accepted) +
+              L", reason=" + reason +
+              L", expected_remote_id=" + expected_remote_id +
+              L", active_remote_id=" + active_remote_id +
+              L", login=" + DescribeLoginRequestForLog(login_request));
+      return accepted;
+    };
+
+    auto is_file_transfer_stop_requested = [this]() -> bool {
+      return stop_rendezvous_.load() ||
+             stop_active_session_.load() ||
+             stop_auxiliary_session_.load();
+    };
+
     auto run_minimal_plain_session_over_connection = [this, describe_receive_state](
                                                      TcpFramedConnection* connection,
                                                      const std::wstring& channel_name,
@@ -11382,6 +13884,799 @@ void PortableHostApp::RendezvousWorker() {
             channel_name +
             L" reached plain LoginRequest; relay/direct transport path works, desktop session protocol still pending";
       }
+      return true;
+    };
+
+    auto run_file_transfer_session_loop =
+        [this, describe_receive_state, &is_file_transfer_stop_requested](
+            TcpFramedConnection* connection,
+            const std::wstring& channel_name,
+            const std::wstring& connected_remote_id,
+            const std::wstring& connected_remote_name,
+            const std::wstring& initial_dir_request,
+            bool initial_show_hidden,
+            std::wstring* session_status) -> bool {
+      active_session_connected_.store(true);
+      StoreActiveSessionIdentity(connected_remote_id, connected_remote_name);
+      AppendPortableHostLog(
+          L"file-transfer",
+          channel_name + L" starting; remote_id=" + connected_remote_id +
+              L", remote_name=" + connected_remote_name +
+              L", initial_dir=" + initial_dir_request +
+              L", show_hidden=" + BoolToLogText(initial_show_hidden));
+      ScopeExit log_exit([&]() {
+        AppendPortableHostLog(
+            L"file-transfer",
+            channel_name + L" exiting; status=" +
+                (session_status == nullptr ? std::wstring() : *session_status));
+      });
+
+      std::unordered_map<int, std::shared_ptr<FileTransferReadJob>> read_jobs;
+      std::unordered_map<int, std::shared_ptr<FileTransferWriteJob>> write_jobs;
+      ScopeExit cleanup_jobs([&read_jobs, &write_jobs]() {
+        for (auto& entry : read_jobs) {
+          if (entry.second != nullptr) {
+            CloseFileTransferHandle(&entry.second->file);
+          }
+        }
+        for (auto& entry : write_jobs) {
+          if (entry.second != nullptr) {
+            DiscardFileTransferWriteCurrentFile(entry.second.get());
+          }
+        }
+      });
+
+      auto erase_read_job = [&](int id) {
+        auto cursor = read_jobs.find(id);
+        if (cursor == read_jobs.end()) {
+          return;
+        }
+        if (cursor->second != nullptr) {
+          CloseFileTransferHandle(&cursor->second->file);
+        }
+        read_jobs.erase(cursor);
+      };
+      auto erase_write_job = [&](int id, bool discard_current_file) {
+        auto cursor = write_jobs.find(id);
+        if (cursor == write_jobs.end()) {
+          return;
+        }
+        if (cursor->second != nullptr) {
+          if (discard_current_file) {
+            DiscardFileTransferWriteCurrentFile(cursor->second.get());
+          } else {
+            std::wstring ignored_error;
+            FinalizeFileTransferWriteCurrentFile(cursor->second.get(), &ignored_error);
+          }
+          CloseFileTransferHandle(&cursor->second->file);
+        }
+        write_jobs.erase(cursor);
+      };
+
+      auto send_file_transfer_error =
+          [&](int id, int file_num, const std::wstring& error_text) -> bool {
+        AppendPortableHostLog(
+            L"file-transfer",
+            channel_name + L" sending error response; id=" + std::to_wstring(id) +
+                L", file_num=" + std::to_wstring(file_num) +
+                L", error=" + error_text);
+        if (!connection->SendFrame(
+                EncodeFileTransferErrorResponseMessage(id, error_text, file_num),
+                session_status)) {
+          if (session_status != nullptr && !session_status->empty()) {
+            *session_status = channel_name + L" file-transfer error send failed: " + *session_status;
+          }
+          return false;
+        }
+        return true;
+      };
+
+      auto pump_read_jobs = [&]() -> bool {
+        for (auto cursor = read_jobs.begin(); cursor != read_jobs.end();) {
+          const std::shared_ptr<FileTransferReadJob>& job = cursor->second;
+          if (job == nullptr) {
+            cursor = read_jobs.erase(cursor);
+            continue;
+          }
+          if (IsFileTransferReadJobComplete(*job)) {
+            CloseFileTransferHandle(&job->file);
+            cursor = read_jobs.erase(cursor);
+            continue;
+          }
+
+          if (!job->sent_digest) {
+            const FileTransferEntryData& entry = job->files[job->file_num];
+            if (!connection->SendFrame(
+                    EncodeFileTransferDigestResponseMessage(
+                        job->id,
+                        job->file_num,
+                        entry.modified_time,
+                        entry.size,
+                        false,
+                        false,
+                        0,
+                        false),
+                    session_status)) {
+              if (session_status != nullptr && !session_status->empty()) {
+                *session_status =
+                    channel_name + L" file-transfer digest send failed: " + *session_status;
+              }
+              return false;
+            }
+            job->sent_digest = true;
+            job->waiting_for_confirm = true;
+            ++cursor;
+            continue;
+          }
+          if (job->waiting_for_confirm && !job->file_confirmed) {
+            ++cursor;
+            continue;
+          }
+
+          std::wstring io_error;
+          if (!OpenFileTransferReadHandle(job.get(), &io_error)) {
+            if (!send_file_transfer_error(job->id, job->file_num, io_error)) {
+              return false;
+            }
+            AdvanceFileTransferReadJob(job.get());
+            if (IsFileTransferReadJobComplete(*job)) {
+              cursor = read_jobs.erase(cursor);
+            } else {
+              ++cursor;
+            }
+            continue;
+          }
+
+          std::vector<unsigned char> data(kFileTransferBlockSize);
+          DWORD read = 0;
+          const BOOL ok = ReadFile(
+              job->file,
+              data.data(),
+              static_cast<DWORD>(data.size()),
+              &read,
+              nullptr);
+          if (!ok) {
+            if (!send_file_transfer_error(
+                    job->id,
+                    job->file_num,
+                    L"ReadFile failed while streaming file transfer data")) {
+              return false;
+            }
+            AdvanceFileTransferReadJob(job.get());
+            if (IsFileTransferReadJobComplete(*job)) {
+              cursor = read_jobs.erase(cursor);
+            } else {
+              ++cursor;
+            }
+            continue;
+          }
+
+          data.resize(read);
+          if (read == 0) {
+            if (!connection->SendFrame(
+                    EncodeFileTransferDoneResponseMessage(job->id, job->file_num),
+                    session_status)) {
+              if (session_status != nullptr && !session_status->empty()) {
+                *session_status =
+                    channel_name + L" file-transfer done send failed: " + *session_status;
+              }
+              return false;
+            }
+            AdvanceFileTransferReadJob(job.get());
+            if (IsFileTransferReadJobComplete(*job)) {
+              cursor = read_jobs.erase(cursor);
+            } else {
+              ++cursor;
+            }
+            continue;
+          }
+
+          if (!connection->SendFrame(
+                  EncodeFileTransferBlockResponseMessage(
+                      job->id,
+                      job->file_num,
+                      data,
+                      false,
+                      0U),
+                  session_status)) {
+            if (session_status != nullptr && !session_status->empty()) {
+              *session_status =
+                  channel_name + L" file-transfer block send failed: " + *session_status;
+            }
+            return false;
+          }
+          ++cursor;
+        }
+        return true;
+      };
+
+      std::wstring initial_dir =
+          initial_dir_request.empty() ? L"/" : ResolveFileTransferFilesystemPath(initial_dir_request);
+      std::vector<FileTransferEntryData> initial_entries;
+      std::wstring initial_error;
+      if (!CollectFileTransferDirectoryEntries(
+              initial_dir,
+              initial_show_hidden,
+              &initial_entries,
+              &initial_error)) {
+        initial_dir = L"/";
+        initial_entries.clear();
+        initial_error.clear();
+        if (!CollectFileTransferDirectoryEntries(initial_dir, true, &initial_entries, &initial_error)) {
+          if (!send_file_transfer_error(0, 0, initial_error.empty()
+                                                  ? L"failed to enumerate initial file-transfer directory"
+                                                  : initial_error)) {
+            return false;
+          }
+        }
+      }
+      if (!connection->SendFrame(
+              EncodeFileTransferDirectoryResponseMessage(0, initial_dir, initial_entries),
+              session_status)) {
+        if (session_status != nullptr && !session_status->empty()) {
+          *session_status = channel_name + L" initial file-transfer listing send failed: " + *session_status;
+        }
+        return false;
+      }
+      AppendPortableHostLog(
+          L"file-transfer",
+          channel_name + L" initial listing sent; path=" + initial_dir +
+              L", entries=" + std::to_wstring(initial_entries.size()));
+
+      if (session_status != nullptr) {
+        *session_status = channel_name + L" file-transfer session ready";
+      }
+
+      std::vector<unsigned char> frame;
+      while (!is_file_transfer_stop_requested()) {
+        if (!pump_read_jobs()) {
+          return false;
+        }
+
+        frame.clear();
+        const TcpFramedConnection::ReceiveState receive_state =
+            connection->ReceiveFrame(&frame, kSessionPollMs, session_status);
+        if (receive_state == TcpFramedConnection::ReceiveState::kTimeout) {
+          if (session_status != nullptr) {
+            if (!read_jobs.empty()) {
+              *session_status = channel_name + L" file-transfer session streaming files";
+            } else if (!write_jobs.empty()) {
+              *session_status = channel_name + L" file-transfer session receiving files";
+            } else {
+              *session_status = channel_name + L" file-transfer session connected; waiting for action";
+            }
+          }
+          continue;
+        }
+        if (receive_state != TcpFramedConnection::ReceiveState::kFrame) {
+          if (session_status != nullptr) {
+            const std::wstring previous = *session_status;
+            *session_status =
+                channel_name + L" file-transfer receive " + describe_receive_state(receive_state);
+            if (!previous.empty()) {
+              *session_status += L": ";
+              *session_status += previous;
+            }
+          }
+          AppendPortableHostLog(
+              L"file-transfer",
+              channel_name + L" receive state=" + describe_receive_state(receive_state));
+          return true;
+        }
+
+        FileTransferActionData action;
+        if (ParseFileTransferActionMessage(frame, &action)) {
+          AppendPortableHostLog(
+              L"file-transfer",
+              channel_name + L" received action: " + DescribeFileTransferActionForLog(action));
+          switch (action.kind) {
+            case FileTransferActionKind::kReadDir: {
+              const std::wstring listing_path =
+                  action.read_dir.path.empty()
+                      ? L"/"
+                      : ResolveFileTransferFilesystemPath(action.read_dir.path);
+              std::vector<FileTransferEntryData> entries;
+              std::wstring listing_error;
+              if (!CollectFileTransferDirectoryEntries(
+                      listing_path,
+                      action.read_dir.include_hidden,
+                      &entries,
+                      &listing_error)) {
+                if (!send_file_transfer_error(0, 0, listing_error)) {
+                  return false;
+                }
+              } else if (!connection->SendFrame(
+                             EncodeFileTransferDirectoryResponseMessage(0, listing_path, entries),
+                             session_status)) {
+                if (session_status != nullptr && !session_status->empty()) {
+                  *session_status =
+                      channel_name + L" file-transfer directory send failed: " + *session_status;
+                }
+                return false;
+              }
+              break;
+            }
+            case FileTransferActionKind::kAllFiles: {
+              const std::wstring listing_path =
+                  action.all_files.path.empty()
+                      ? L"/"
+                      : ResolveFileTransferFilesystemPath(action.all_files.path);
+              std::vector<FileTransferEntryData> entries;
+              std::wstring listing_error;
+              if (!CollectFileTransferRecursiveFiles(
+                      listing_path,
+                      action.all_files.include_hidden,
+                      &entries,
+                      &listing_error)) {
+                if (!send_file_transfer_error(action.all_files.id, -1, listing_error)) {
+                  return false;
+                }
+              } else if (!connection->SendFrame(
+                             EncodeFileTransferDirectoryResponseMessage(
+                                 action.all_files.id,
+                                 listing_path,
+                                 entries),
+                             session_status)) {
+                if (session_status != nullptr && !session_status->empty()) {
+                  *session_status =
+                      channel_name + L" file-transfer recursive listing send failed: " +
+                      *session_status;
+                }
+                return false;
+              }
+              break;
+            }
+            case FileTransferActionKind::kSend: {
+              if (action.send.file_type != 0) {
+                if (!send_file_transfer_error(
+                        action.send.id,
+                        action.send.file_num,
+                        L"only generic file-transfer send is supported")) {
+                  return false;
+                }
+                break;
+              }
+              std::vector<FileTransferEntryData> files;
+              std::wstring listing_error;
+              if (!CollectFileTransferRecursiveFiles(
+                      action.send.path,
+                      action.send.include_hidden,
+                      &files,
+                      &listing_error)) {
+                if (!send_file_transfer_error(action.send.id, action.send.file_num, listing_error)) {
+                  return false;
+                }
+                break;
+              }
+              std::shared_ptr<FileTransferReadJob> job = std::make_shared<FileTransferReadJob>();
+              job->id = action.send.id;
+              job->source_path = ResolveFileTransferFilesystemPath(action.send.path);
+              job->files = files;
+              job->file_num = action.send.file_num >= 0 &&
+                                      action.send.file_num < static_cast<int>(files.size())
+                                  ? action.send.file_num
+                                  : 0;
+              read_jobs[job->id] = job;
+              if (!connection->SendFrame(
+                      EncodeFileTransferDirectoryResponseMessage(
+                          action.send.id,
+                          ResolveFileTransferFilesystemPath(action.send.path),
+                          files),
+                      session_status)) {
+                if (session_status != nullptr && !session_status->empty()) {
+                  *session_status =
+                      channel_name + L" file-transfer send listing failed: " + *session_status;
+                }
+                return false;
+              }
+              break;
+            }
+            case FileTransferActionKind::kReceive: {
+              if (action.receive.files.empty()) {
+                if (!send_file_transfer_error(action.receive.id, action.receive.file_num, L"no files")) {
+                  return false;
+                }
+                break;
+              }
+              bool valid_files = true;
+              std::wstring validation_error;
+              for (size_t index = 0; index < action.receive.files.size(); ++index) {
+                if (!ValidateFileTransferRelativePath(
+                        action.receive.files[index].name,
+                        action.receive.files.size() == 1 &&
+                            action.receive.files[index].name.empty(),
+                        &validation_error)) {
+                  valid_files = false;
+                  break;
+                }
+              }
+              if (!valid_files) {
+                if (!send_file_transfer_error(
+                        action.receive.id,
+                        action.receive.file_num,
+                        validation_error.empty()
+                            ? L"invalid incoming file-transfer file list"
+                            : validation_error)) {
+                  return false;
+                }
+                break;
+              }
+
+              std::shared_ptr<FileTransferWriteJob> job = std::make_shared<FileTransferWriteJob>();
+              job->id = action.receive.id;
+              job->target_path = ResolveFileTransferFilesystemPath(action.receive.path);
+              job->files = action.receive.files;
+              write_jobs[job->id] = job;
+              break;
+            }
+            case FileTransferActionKind::kCancel:
+              erase_read_job(action.cancel.id);
+              erase_write_job(action.cancel.id, true);
+              break;
+            case FileTransferActionKind::kSendConfirm: {
+              auto job_cursor = read_jobs.find(action.send_confirm.id);
+              if (job_cursor != read_jobs.end() && job_cursor->second != nullptr) {
+                FileTransferReadJob* job = job_cursor->second.get();
+                if (action.send_confirm.file_num == job->file_num) {
+                  if (action.send_confirm.has_skip && action.send_confirm.skip) {
+                    AdvanceFileTransferReadJob(job);
+                  } else {
+                    job->waiting_for_confirm = false;
+                    job->file_confirmed = true;
+                    if (action.send_confirm.has_offset_blk) {
+                      job->resume_offset = action.send_confirm.offset_blk;
+                    }
+                  }
+                }
+                if (IsFileTransferReadJobComplete(*job)) {
+                  erase_read_job(action.send_confirm.id);
+                }
+              }
+              break;
+            }
+            case FileTransferActionKind::kReadEmptyDirs:
+              if (!connection->SendFrame(
+                      EncodeFileTransferEmptyDirsResponseMessage(
+                          ResolveFileTransferFilesystemPath(action.read_dir.path)),
+                      session_status)) {
+                if (session_status != nullptr && !session_status->empty()) {
+                  *session_status =
+                      channel_name + L" file-transfer empty-dirs send failed: " + *session_status;
+                }
+                return false;
+              }
+              break;
+            case FileTransferActionKind::kCreate:
+              {
+                std::wstring create_path;
+                std::wstring create_error;
+                if (!ResolveFileTransferMutablePath(
+                        action.create.path,
+                        &create_path,
+                        &create_error)) {
+                  if (!send_file_transfer_error(
+                          action.create.id,
+                          -1,
+                          create_error.empty() ? L"invalid directory path" : create_error)) {
+                    return false;
+                  }
+                  break;
+                }
+
+                const DWORD existing_attributes = GetFileAttributesW(create_path.c_str());
+                bool created = false;
+                if (existing_attributes != INVALID_FILE_ATTRIBUTES) {
+                  if ((existing_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                    created = true;
+                  } else {
+                    create_error = L"target path already exists as a file";
+                  }
+                } else {
+                  created = EnsureDirectoryExistsRecursive(create_path, &create_error);
+                }
+
+                if (!created) {
+                  if (!send_file_transfer_error(
+                          action.create.id,
+                          -1,
+                          create_error.empty() ? L"failed to create directory" : create_error)) {
+                    return false;
+                  }
+                  break;
+                }
+
+                if (!connection->SendFrame(
+                        EncodeFileTransferDoneResponseMessage(action.create.id, -1),
+                        session_status)) {
+                  if (session_status != nullptr && !session_status->empty()) {
+                    *session_status =
+                        channel_name + L" file-transfer create-dir done send failed: " +
+                        *session_status;
+                  }
+                  return false;
+                }
+              }
+              break;
+            case FileTransferActionKind::kRemoveDir:
+              {
+                std::wstring remove_path;
+                std::wstring remove_error;
+                if (!ResolveFileTransferMutablePath(
+                        action.remove_dir.path,
+                        &remove_path,
+                        &remove_error)) {
+                  if (!send_file_transfer_error(
+                          action.remove_dir.id,
+                          -1,
+                          remove_error.empty() ? L"invalid directory path" : remove_error)) {
+                    return false;
+                  }
+                  break;
+                }
+
+                bool removed = false;
+                const DWORD attributes = GetFileAttributesW(remove_path.c_str());
+                if (attributes == INVALID_FILE_ATTRIBUTES) {
+                  remove_error = L"directory not found";
+                } else if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                  remove_error = L"path is not a directory";
+                } else if (action.remove_dir.recursive) {
+                  removed = RemoveFileTransferDirectoryTree(remove_path, &remove_error);
+                } else {
+                  TryRemoveReadOnlyAttribute(remove_path, attributes);
+                  removed = RemoveDirectoryW(remove_path.c_str()) != FALSE;
+                  if (!removed) {
+                    remove_error =
+                        L"RemoveDirectoryW failed, error=" + std::to_wstring(GetLastError());
+                  }
+                }
+
+                if (!removed) {
+                  if (!send_file_transfer_error(
+                          action.remove_dir.id,
+                          -1,
+                          remove_error.empty() ? L"failed to remove directory" : remove_error)) {
+                    return false;
+                  }
+                  break;
+                }
+
+                if (!connection->SendFrame(
+                        EncodeFileTransferDoneResponseMessage(action.remove_dir.id, -1),
+                        session_status)) {
+                  if (session_status != nullptr && !session_status->empty()) {
+                    *session_status =
+                        channel_name + L" file-transfer remove-dir done send failed: " +
+                        *session_status;
+                  }
+                  return false;
+                }
+              }
+              break;
+            case FileTransferActionKind::kRemoveFile:
+              {
+                std::wstring remove_path;
+                std::wstring remove_error;
+                if (!ResolveFileTransferMutablePath(
+                        action.remove_file.path,
+                        &remove_path,
+                        &remove_error)) {
+                  if (!send_file_transfer_error(
+                          action.remove_file.id,
+                          action.remove_file.file_num,
+                          remove_error.empty() ? L"invalid file path" : remove_error)) {
+                    return false;
+                  }
+                  break;
+                }
+
+                const DWORD attributes = GetFileAttributesW(remove_path.c_str());
+                bool removed = false;
+                if (attributes == INVALID_FILE_ATTRIBUTES) {
+                  remove_error = L"file not found";
+                } else if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                  remove_error = L"path is a directory";
+                } else {
+                  TryRemoveReadOnlyAttribute(remove_path, attributes);
+                  removed = DeleteFileW(remove_path.c_str()) != FALSE;
+                  if (!removed) {
+                    remove_error =
+                        L"DeleteFileW failed, error=" + std::to_wstring(GetLastError());
+                  }
+                }
+
+                if (!removed) {
+                  if (!send_file_transfer_error(
+                          action.remove_file.id,
+                          action.remove_file.file_num,
+                          remove_error.empty() ? L"failed to remove file" : remove_error)) {
+                    return false;
+                  }
+                  break;
+                }
+
+                if (!connection->SendFrame(
+                        EncodeFileTransferDoneResponseMessage(
+                            action.remove_file.id,
+                            action.remove_file.file_num),
+                        session_status)) {
+                  if (session_status != nullptr && !session_status->empty()) {
+                    *session_status =
+                        channel_name + L" file-transfer remove-file done send failed: " +
+                        *session_status;
+                  }
+                  return false;
+                }
+              }
+              break;
+            case FileTransferActionKind::kRename:
+              if (!send_file_transfer_error(
+                      action.rename.id,
+                      0,
+                      L"renaming through file-transfer is not supported yet")) {
+                return false;
+              }
+              break;
+            default:
+              if (!send_file_transfer_error(0, 0, L"file-transfer operation is not supported yet")) {
+                return false;
+              }
+              break;
+          }
+
+          if (!pump_read_jobs()) {
+            return false;
+          }
+          continue;
+        }
+
+        FileTransferResponseData response;
+        if (ParseFileTransferResponseMessage(frame, &response)) {
+          AppendPortableHostLog(
+              L"file-transfer",
+              channel_name + L" received response: " + DescribeFileTransferResponseForLog(response));
+          switch (response.kind) {
+            case FileTransferResponseKind::kBlock: {
+              auto job_cursor = write_jobs.find(response.block.id);
+              if (job_cursor == write_jobs.end() || job_cursor->second == nullptr) {
+                break;
+              }
+              std::wstring write_error;
+              if (!PrepareFileTransferWriteTarget(
+                      job_cursor->second.get(),
+                      response.block.file_num,
+                      &write_error)) {
+                if (!send_file_transfer_error(response.block.id, response.block.file_num, write_error)) {
+                  return false;
+                }
+                erase_write_job(response.block.id, true);
+                break;
+              }
+
+              std::vector<unsigned char> plain;
+              const std::vector<unsigned char>* payload = &response.block.data;
+              if (response.block.compressed) {
+                if (!DecompressZstdBytes(response.block.data, &plain, &write_error)) {
+                  if (!send_file_transfer_error(
+                          response.block.id,
+                          response.block.file_num,
+                          write_error.empty()
+                              ? L"failed to decompress file-transfer block"
+                              : write_error)) {
+                    return false;
+                  }
+                  erase_write_job(response.block.id, true);
+                  break;
+                }
+                payload = &plain;
+              }
+
+              DWORD written = 0;
+              const BOOL ok = payload->empty()
+                                  ? TRUE
+                                  : WriteFile(
+                                        job_cursor->second->file,
+                                        payload->data(),
+                                        static_cast<DWORD>(payload->size()),
+                                        &written,
+                                        nullptr);
+              if (!ok || written != payload->size()) {
+                if (!send_file_transfer_error(
+                        response.block.id,
+                        response.block.file_num,
+                        L"WriteFile failed while receiving file-transfer block")) {
+                  return false;
+                }
+                erase_write_job(response.block.id, true);
+              }
+              break;
+            }
+            case FileTransferResponseKind::kDone: {
+              auto job_cursor = write_jobs.find(response.done.id);
+              if (job_cursor == write_jobs.end() || job_cursor->second == nullptr) {
+                break;
+              }
+              std::wstring write_error;
+              if (!PrepareFileTransferWriteTarget(
+                      job_cursor->second.get(),
+                      response.done.file_num,
+                      &write_error) ||
+                  !FinalizeFileTransferWriteCurrentFile(job_cursor->second.get(), &write_error)) {
+                if (!send_file_transfer_error(response.done.id, response.done.file_num, write_error)) {
+                  return false;
+                }
+                erase_write_job(response.done.id, true);
+                break;
+              }
+              if (response.done.file_num + 1 >=
+                  static_cast<int>(job_cursor->second->files.size())) {
+                erase_write_job(response.done.id, false);
+              }
+              break;
+            }
+            case FileTransferResponseKind::kDigest:
+              if (write_jobs.find(response.digest.id) != write_jobs.end()) {
+                if (!connection->SendFrame(
+                        EncodeFileTransferSendConfirmActionMessage(
+                            response.digest.id,
+                            response.digest.file_num,
+                            false,
+                            0U),
+                        session_status)) {
+                  if (session_status != nullptr && !session_status->empty()) {
+                    *session_status =
+                        channel_name + L" file-transfer confirm send failed: " + *session_status;
+                  }
+                  return false;
+                }
+              }
+              break;
+            case FileTransferResponseKind::kError:
+              erase_read_job(response.error.id);
+              erase_write_job(response.error.id, true);
+              if (session_status != nullptr) {
+                *session_status =
+                    channel_name + L" peer file-transfer error: " + response.error.error;
+              }
+              break;
+            default:
+              break;
+          }
+
+          if (!pump_read_jobs()) {
+            return false;
+          }
+          continue;
+        }
+
+        const SessionMessageType session_message = ParseSessionMessage(frame);
+        if (session_message.has_close_reason) {
+          if (session_status != nullptr) {
+            *session_status = channel_name + L" file-transfer closed by peer";
+            if (!session_message.close_reason.empty()) {
+              *session_status += L": ";
+              *session_status += session_message.close_reason;
+            }
+          }
+          AppendPortableHostLog(
+              L"file-transfer",
+              channel_name + L" peer closed session; reason=" + session_message.close_reason);
+          return true;
+        }
+
+        if (session_status != nullptr) {
+          *session_status =
+              channel_name +
+              L" file-transfer session ignoring follow-up fields=" +
+              FormatObservedFields(ExtractTopLevelMessageFields(frame));
+        }
+        AppendPortableHostLog(
+            L"file-transfer",
+            channel_name +
+                L" ignored follow-up message fields=" +
+                FormatObservedFields(ExtractTopLevelMessageFields(frame)));
+      }
+
       return true;
     };
 
@@ -11925,6 +15220,8 @@ void PortableHostApp::RendezvousWorker() {
          session_device_uuid_snapshot,
          generate_numeric_password,
          describe_receive_state,
+         &should_auto_accept_secondary_file_transfer,
+         &run_file_transfer_session_loop,
          &run_desktop_session_loop](
             TcpFramedConnection* connection,
             const std::wstring& channel_name,
@@ -12034,6 +15331,7 @@ void PortableHostApp::RendezvousWorker() {
         bool accepted_temporary_password = false;
         bool accepted_fixed_password = false;
         bool accepted_click_approval = false;
+        bool accepted_secondary_file_transfer = false;
         if (incoming_approval_token != 0) {
           const IncomingApprovalDecision approval_decision =
               GetIncomingApprovalDecision(incoming_approval_token);
@@ -12095,50 +15393,68 @@ void PortableHostApp::RendezvousWorker() {
             }
             return false;
           }
+          AppendPortableHostLog(
+              L"login",
+              channel_name + L" parsed LoginRequest: " + DescribeLoginRequestForLog(login_request));
 
           if (login_request.password.empty()) {
-            saw_empty_login = true;
-            if (incoming_approval_token == 0) {
-              incoming_approval_token = BeginIncomingApproval(
-                  display_remote_id.empty()
-                      ? login_request.my_id
-                      : display_remote_id,
-                  display_remote_id.empty()
-                      ? login_request.my_name
-                      : L"");
+            if (should_auto_accept_secondary_file_transfer(login_request, display_remote_id)) {
+              accepted_secondary_file_transfer = true;
+              AppendPortableHostLog(
+                  L"login",
+                  channel_name + L" auto-accepted secondary file-transfer login");
+            } else {
+              saw_empty_login = true;
+              if (incoming_approval_token == 0) {
+                incoming_approval_token = BeginIncomingApproval(
+                    display_remote_id.empty()
+                        ? login_request.my_id
+                        : display_remote_id,
+                    display_remote_id.empty()
+                        ? login_request.my_name
+                        : L"");
+              }
+              manual_password_deadline =
+                  std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(kIncomingApprovalTimeoutMs);
+              if (session_status != nullptr) {
+                *session_status =
+                    channel_name + L" received incoming remote request; waiting for approval or password entry";
+              }
+              AppendPortableHostLog(
+                  L"login",
+                  channel_name + L" empty-password login is waiting for local approval/password entry");
+              continue;
             }
-            manual_password_deadline =
-                std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(kIncomingApprovalTimeoutMs);
-            if (session_status != nullptr) {
-              *session_status =
-                  channel_name + L" received incoming remote request; waiting for approval or password entry";
-            }
-            continue;
           }
 
-          accepted_temporary_password =
-              !expected_temporary_password.empty() &&
-              login_request.password == expected_temporary_password;
-          accepted_fixed_password =
-              !expected_fixed_password.empty() &&
-              login_request.password == expected_fixed_password;
-          if (!accepted_temporary_password &&
-              !accepted_fixed_password) {
-            const std::vector<unsigned char> wrong_password =
-                EncodeLoginResponseErrorMessage(kLoginMsgWrongPassword);
-            if (!connection->SendFrame(wrong_password, session_status)) {
-              if (session_status != nullptr && !session_status->empty()) {
-                *session_status =
-                    channel_name + L" wrong password response send failed: " + *session_status;
+          if (!accepted_secondary_file_transfer) {
+            accepted_temporary_password =
+                !expected_temporary_password.empty() &&
+                login_request.password == expected_temporary_password;
+            accepted_fixed_password =
+                !expected_fixed_password.empty() &&
+                login_request.password == expected_fixed_password;
+            if (!accepted_temporary_password &&
+                !accepted_fixed_password) {
+              const std::vector<unsigned char> wrong_password =
+                  EncodeLoginResponseErrorMessage(kLoginMsgWrongPassword);
+              if (!connection->SendFrame(wrong_password, session_status)) {
+                if (session_status != nullptr && !session_status->empty()) {
+                  *session_status =
+                      channel_name + L" wrong password response send failed: " + *session_status;
+                }
+                return false;
               }
-              return false;
+              if (session_status != nullptr) {
+                *session_status =
+                    channel_name + L" rejected LoginRequest with Wrong Password; waiting for retry";
+              }
+              AppendPortableHostLog(
+                  L"login",
+                  channel_name + L" rejected LoginRequest with wrong password");
+              continue;
             }
-            if (session_status != nullptr) {
-              *session_status =
-                  channel_name + L" rejected LoginRequest with Wrong Password; waiting for retry";
-            }
-            continue;
           }
         }
 
@@ -12152,7 +15468,11 @@ void PortableHostApp::RendezvousWorker() {
         }
 
         if (session_status != nullptr) {
-          if (accepted_fixed_password) {
+          if (accepted_secondary_file_transfer) {
+            *session_status =
+                channel_name +
+                L" accepted secondary file-transfer request from active session and sent PeerInfo login response";
+          } else if (accepted_fixed_password) {
             *session_status =
                 channel_name + L" accepted fixed password and sent PeerInfo login response";
           } else if (accepted_click_approval) {
@@ -12164,6 +15484,13 @@ void PortableHostApp::RendezvousWorker() {
                                   : channel_name + L" accepted LoginRequest and sent PeerInfo login response";
           }
         }
+        AppendPortableHostLog(
+            L"login",
+            channel_name + L" sent PeerInfo login response; secondary_file_transfer=" +
+                BoolToLogText(accepted_secondary_file_transfer) +
+                L", fixed_password=" + BoolToLogText(accepted_fixed_password) +
+                L", click_approval=" + BoolToLogText(accepted_click_approval) +
+                L", manual_login=" + BoolToLogText(saw_empty_login));
         std::wstring connected_remote_id;
         std::wstring connected_remote_name;
         if (accepted_click_approval) {
@@ -12180,6 +15507,17 @@ void PortableHostApp::RendezvousWorker() {
         if (incoming_approval_token != 0) {
           CompleteIncomingApproval(incoming_approval_token);
           incoming_approval_token = 0;
+        }
+
+        if (login_request.has_file_transfer) {
+          return run_file_transfer_session_loop(
+              connection,
+              channel_name,
+              connected_remote_id,
+              connected_remote_name,
+              login_request.file_transfer_dir,
+              login_request.file_transfer_show_hidden,
+              session_status);
         }
 
         if (!connection->SendFrame(EncodeCliprdrMonitorReadyMessage(), session_status)) {
@@ -12205,7 +15543,9 @@ void PortableHostApp::RendezvousWorker() {
          session_device_uuid_snapshot,
          session_secret_key_bytes,
          generate_numeric_password,
-         describe_receive_state](
+         describe_receive_state,
+         &should_auto_accept_secondary_file_transfer,
+         &run_file_transfer_session_loop](
                                                       TcpFramedConnection* connection,
                                                       const std::wstring& channel_name,
                                                       const std::wstring& display_remote_id_override,
@@ -12374,6 +15714,7 @@ void PortableHostApp::RendezvousWorker() {
         bool accepted_temporary_password = false;
         bool accepted_fixed_password = false;
         bool accepted_click_approval = false;
+        bool accepted_secondary_file_transfer = false;
         if (incoming_approval_token != 0) {
           const IncomingApprovalDecision approval_decision =
               GetIncomingApprovalDecision(incoming_approval_token);
@@ -12435,50 +15776,69 @@ void PortableHostApp::RendezvousWorker() {
             }
             return false;
           }
+          AppendPortableHostLog(
+              L"login",
+              channel_name + L" parsed encrypted LoginRequest: " +
+                  DescribeLoginRequestForLog(login_request));
 
           if (login_request.password.empty()) {
-            saw_empty_login = true;
-            if (incoming_approval_token == 0) {
-              incoming_approval_token = BeginIncomingApproval(
-                  display_remote_id.empty()
-                      ? login_request.my_id
-                      : display_remote_id,
-                  display_remote_id.empty()
-                      ? login_request.my_name
-                      : L"");
+            if (should_auto_accept_secondary_file_transfer(login_request, display_remote_id)) {
+              accepted_secondary_file_transfer = true;
+              AppendPortableHostLog(
+                  L"login",
+                  channel_name + L" auto-accepted secondary encrypted file-transfer login");
+            } else {
+              saw_empty_login = true;
+              if (incoming_approval_token == 0) {
+                incoming_approval_token = BeginIncomingApproval(
+                    display_remote_id.empty()
+                        ? login_request.my_id
+                        : display_remote_id,
+                    display_remote_id.empty()
+                        ? login_request.my_name
+                        : L"");
+              }
+              manual_password_deadline =
+                  std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(kIncomingApprovalTimeoutMs);
+              if (session_status != nullptr) {
+                *session_status =
+                    channel_name + L" received incoming remote request; waiting for approval or password entry";
+              }
+              AppendPortableHostLog(
+                  L"login",
+                  channel_name + L" empty-password encrypted login is waiting for local approval/password entry");
+              continue;
             }
-            manual_password_deadline =
-                std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(kIncomingApprovalTimeoutMs);
-            if (session_status != nullptr) {
-              *session_status =
-                  channel_name + L" received incoming remote request; waiting for approval or password entry";
-            }
-            continue;
           }
 
-          accepted_temporary_password =
-              !expected_temporary_password.empty() &&
-              login_request.password == expected_temporary_password;
-          accepted_fixed_password =
-              !expected_fixed_password.empty() &&
-              login_request.password == expected_fixed_password;
-          if (!accepted_temporary_password &&
-              !accepted_fixed_password) {
-            const std::vector<unsigned char> wrong_password =
-                EncodeLoginResponseErrorMessage(kLoginMsgWrongPassword);
-            if (!connection->SendFrame(wrong_password, session_status)) {
-              if (session_status != nullptr && !session_status->empty()) {
-                *session_status =
-                    channel_name + L" wrong password response send failed: " + *session_status;
+          if (!accepted_secondary_file_transfer) {
+            accepted_temporary_password =
+                !expected_temporary_password.empty() &&
+                login_request.password == expected_temporary_password;
+            accepted_fixed_password =
+                !expected_fixed_password.empty() &&
+                login_request.password == expected_fixed_password;
+            if (!accepted_temporary_password &&
+                !accepted_fixed_password) {
+              const std::vector<unsigned char> wrong_password =
+                  EncodeLoginResponseErrorMessage(kLoginMsgWrongPassword);
+              if (!connection->SendFrame(wrong_password, session_status)) {
+                if (session_status != nullptr && !session_status->empty()) {
+                  *session_status =
+                      channel_name + L" wrong password response send failed: " + *session_status;
+                }
+                return false;
               }
-              return false;
+              if (session_status != nullptr) {
+                *session_status =
+                    channel_name + L" rejected encrypted LoginRequest with Wrong Password; waiting for retry";
+              }
+              AppendPortableHostLog(
+                  L"login",
+                  channel_name + L" rejected encrypted LoginRequest with wrong password");
+              continue;
             }
-            if (session_status != nullptr) {
-              *session_status =
-                  channel_name + L" rejected encrypted LoginRequest with Wrong Password; waiting for retry";
-            }
-            continue;
           }
         }
 
@@ -12492,7 +15852,11 @@ void PortableHostApp::RendezvousWorker() {
         }
 
         if (session_status != nullptr) {
-          if (accepted_fixed_password) {
+          if (accepted_secondary_file_transfer) {
+            *session_status =
+                channel_name +
+                L" accepted secondary encrypted file-transfer request from active session and sent PeerInfo login response";
+          } else if (accepted_fixed_password) {
             *session_status =
                 channel_name + L" accepted fixed password and sent PeerInfo login response";
           } else if (accepted_click_approval) {
@@ -12504,6 +15868,13 @@ void PortableHostApp::RendezvousWorker() {
                                   : channel_name + L" accepted encrypted LoginRequest and sent PeerInfo login response";
           }
         }
+        AppendPortableHostLog(
+            L"login",
+            channel_name + L" sent encrypted PeerInfo login response; secondary_file_transfer=" +
+                BoolToLogText(accepted_secondary_file_transfer) +
+                L", fixed_password=" + BoolToLogText(accepted_fixed_password) +
+                L", click_approval=" + BoolToLogText(accepted_click_approval) +
+                L", manual_login=" + BoolToLogText(saw_empty_login));
         std::wstring connected_remote_id;
         std::wstring connected_remote_name;
         if (accepted_click_approval) {
@@ -12520,6 +15891,17 @@ void PortableHostApp::RendezvousWorker() {
         if (incoming_approval_token != 0) {
           CompleteIncomingApproval(incoming_approval_token);
           incoming_approval_token = 0;
+        }
+
+        if (login_request.has_file_transfer) {
+          return run_file_transfer_session_loop(
+              connection,
+              channel_name,
+              connected_remote_id,
+              connected_remote_name,
+              login_request.file_transfer_dir,
+              login_request.file_transfer_show_hidden,
+              session_status);
         }
 
         if (!connection->SendFrame(EncodeCliprdrMonitorReadyMessage(), session_status)) {
@@ -13054,6 +16436,288 @@ void PortableHostApp::RendezvousWorker() {
       }
     };
 
+    auto run_auxiliary_secure_session_over_connection =
+        [this,
+         session_config,
+         session_temporary_password_snapshot,
+         session_fixed_password_snapshot,
+         session_device_uuid_snapshot,
+         session_secret_key_bytes,
+         generate_numeric_password,
+         describe_receive_state,
+         &should_auto_accept_secondary_file_transfer,
+         &run_file_transfer_session_loop](
+            TcpFramedConnection* connection,
+            const std::wstring& channel_name,
+            const std::wstring& display_remote_id_override,
+            std::wstring* session_status) -> bool {
+      RegisterAuxiliarySessionConnection(connection);
+      std::shared_ptr<void> connection_scope(
+          connection,
+          [this](void* registered_connection) {
+            ClearAuxiliarySessionConnection(registered_connection);
+          });
+      const std::wstring display_remote_id = Trim(display_remote_id_override);
+      std::array<unsigned char, crypto_box_PUBLICKEYBYTES> session_curve_public = {};
+      std::array<unsigned char, crypto_box_SECRETKEYBYTES> session_curve_secret = {};
+      std::vector<unsigned char> signed_id = EncodeSignedIdMessage(
+          session_config.host_id,
+          session_secret_key_bytes,
+          &session_curve_public,
+          &session_curve_secret,
+          session_status);
+      if (signed_id.empty()) {
+        return false;
+      }
+      if (!connection->SendRawFrame(signed_id, session_status)) {
+        if (session_status != nullptr && !session_status->empty()) {
+          *session_status = channel_name + L" signed_id send failed: " + *session_status;
+        }
+        return false;
+      }
+
+      std::vector<unsigned char> frame;
+      const TcpFramedConnection::ReceiveState handshake_state =
+          connection->ReceiveFrame(&frame, kConnectTimeoutMs, session_status);
+      if (handshake_state != TcpFramedConnection::ReceiveState::kFrame) {
+        if (session_status != nullptr) {
+          const std::wstring previous = *session_status;
+          *session_status =
+              channel_name + L" handshake receive " + describe_receive_state(handshake_state);
+          if (!previous.empty()) {
+            *session_status += L": ";
+            *session_status += previous;
+          }
+        }
+        return false;
+      }
+
+      PublicKeyMessageData public_key_message;
+      if (!ParsePublicKeyMessage(frame, &public_key_message)) {
+        if (session_status != nullptr) {
+          *session_status = channel_name + L" handshake parse failed";
+        }
+        return false;
+      }
+      if (public_key_message.asymmetric_value.empty()) {
+        if (session_status != nullptr) {
+          *session_status = channel_name + L" controller requested insecure fallback";
+        }
+        return false;
+      }
+
+      std::array<unsigned char, crypto_secretbox_KEYBYTES> symmetric_key = {};
+      if (!DecodeSymmetricKeyFromPublicKey(
+              public_key_message.asymmetric_value,
+              public_key_message.symmetric_value,
+              session_curve_secret,
+              &symmetric_key,
+              session_status)) {
+        if (session_status != nullptr && !session_status->empty()) {
+          *session_status = channel_name + L" handshake key decode failed: " + *session_status;
+        }
+        return false;
+      }
+      connection->SetSymmetricKey(symmetric_key);
+
+      const std::string hash_salt = session_device_uuid_snapshot.empty()
+                                        ? WideToUtf8(session_config.host_id)
+                                        : WideToUtf8(session_device_uuid_snapshot);
+      const std::string hash_challenge =
+          WideToUtf8(generate_numeric_password(session_config.temporary_password_length));
+      if (!connection->SendFrame(
+              EncodeHashMessage(hash_salt, hash_challenge),
+              session_status)) {
+        if (session_status != nullptr && !session_status->empty()) {
+          *session_status = channel_name + L" hash send failed: " + *session_status;
+        }
+        return false;
+      }
+
+      const std::vector<unsigned char> expected_temporary_password =
+          (!session_temporary_password_snapshot.empty())
+              ? ComputeRustDeskLoginPasswordDigest(
+                    session_temporary_password_snapshot,
+                    hash_salt,
+                    hash_challenge)
+              : std::vector<unsigned char>();
+      const std::vector<unsigned char> expected_fixed_password =
+          (!session_fixed_password_snapshot.empty())
+              ? ComputeRustDeskLoginPasswordDigest(
+                    session_fixed_password_snapshot,
+                    hash_salt,
+                    hash_challenge)
+              : std::vector<unsigned char>();
+      const auto session_start = std::chrono::steady_clock::now();
+
+      while (true) {
+        if (IsAuxiliarySessionStopRequested()) {
+          if (session_status != nullptr) {
+            *session_status = channel_name + L" auxiliary session stop requested";
+          }
+          connection->Abort();
+          return true;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - session_start).count();
+        if (elapsed_ms >= static_cast<long long>(kLoginWaitTimeoutMs)) {
+          if (session_status != nullptr) {
+            *session_status = channel_name + L" auxiliary login wait timed out";
+          }
+          return false;
+        }
+        unsigned long remaining_ms = (kLoginWaitTimeoutMs - elapsed_ms) > 1000
+            ? 1000
+            : static_cast<unsigned long>((kLoginWaitTimeoutMs - elapsed_ms) > 0
+                                             ? (kLoginWaitTimeoutMs - elapsed_ms)
+                                             : 1);
+
+        frame.clear();
+        const TcpFramedConnection::ReceiveState login_state =
+            connection->ReceiveFrame(&frame, remaining_ms, session_status);
+        if (login_state != TcpFramedConnection::ReceiveState::kFrame) {
+          if (session_status != nullptr) {
+            const std::wstring previous = *session_status;
+            *session_status =
+                channel_name + L" auxiliary encrypted receive " +
+                describe_receive_state(login_state);
+            if (!previous.empty()) {
+              *session_status += L": ";
+              *session_status += previous;
+            }
+          }
+          return login_state == TcpFramedConnection::ReceiveState::kClosed;
+        }
+
+        LoginRequestData login_request;
+        if (!ParseLoginRequestMessage(frame, &login_request)) {
+          const SessionMessageType session_message = ParseSessionMessage(frame);
+          if (session_message.has_close_reason) {
+            if (session_status != nullptr) {
+              *session_status = channel_name + L" controller closed before auxiliary login";
+              if (!session_message.close_reason.empty()) {
+                *session_status += L": ";
+                *session_status += session_message.close_reason;
+              }
+            }
+            return true;
+          }
+          if (session_status != nullptr) {
+            *session_status =
+                channel_name + L" received encrypted message, but it was not LoginRequest";
+          }
+          return false;
+        }
+        AppendPortableHostLog(
+            L"login",
+            channel_name + L" parsed auxiliary encrypted LoginRequest: " +
+                DescribeLoginRequestForLog(login_request));
+
+        if (!login_request.has_file_transfer) {
+          if (session_status != nullptr) {
+            *session_status = channel_name + L" ignored non-file-transfer auxiliary request";
+          }
+          connection->Abort();
+          return true;
+        }
+
+        bool accepted_secondary_file_transfer = false;
+        bool accepted_temporary_password = false;
+        bool accepted_fixed_password = false;
+        if (login_request.password.empty()) {
+          if (should_auto_accept_secondary_file_transfer(login_request, display_remote_id)) {
+            accepted_secondary_file_transfer = true;
+            AppendPortableHostLog(
+                L"login",
+                channel_name +
+                    L" auto-accepted auxiliary encrypted file-transfer login");
+          } else {
+            const std::vector<unsigned char> wrong_password =
+                EncodeLoginResponseErrorMessage(kLoginMsgWrongPassword);
+            if (!connection->SendFrame(wrong_password, session_status)) {
+              if (session_status != nullptr && !session_status->empty()) {
+                *session_status =
+                    channel_name + L" wrong password response send failed: " + *session_status;
+              }
+              return false;
+            }
+            if (session_status != nullptr) {
+              *session_status =
+                  channel_name +
+                  L" auxiliary file-transfer login missing password and auto-accept did not match";
+            }
+            AppendPortableHostLog(
+                L"login",
+                channel_name +
+                    L" auxiliary file-transfer login missing password and auto-accept did not match");
+            continue;
+          }
+        } else {
+          accepted_temporary_password =
+              !expected_temporary_password.empty() &&
+              login_request.password == expected_temporary_password;
+          accepted_fixed_password =
+              !expected_fixed_password.empty() &&
+              login_request.password == expected_fixed_password;
+          if (!accepted_temporary_password && !accepted_fixed_password) {
+            const std::vector<unsigned char> wrong_password =
+                EncodeLoginResponseErrorMessage(kLoginMsgWrongPassword);
+            if (!connection->SendFrame(wrong_password, session_status)) {
+              if (session_status != nullptr && !session_status->empty()) {
+                *session_status =
+                    channel_name + L" wrong password response send failed: " + *session_status;
+              }
+              return false;
+            }
+            if (session_status != nullptr) {
+              *session_status =
+                  channel_name + L" rejected auxiliary encrypted LoginRequest with wrong password";
+            }
+            AppendPortableHostLog(
+                L"login",
+                channel_name +
+                    L" rejected auxiliary encrypted LoginRequest with wrong password");
+            continue;
+          }
+        }
+
+        const std::vector<unsigned char> login_response =
+            EncodeLoginResponsePeerInfoMessage(session_config);
+        if (!connection->SendFrame(login_response, session_status)) {
+          if (session_status != nullptr && !session_status->empty()) {
+            *session_status = channel_name + L" login response send failed: " + *session_status;
+          }
+          return false;
+        }
+        AppendPortableHostLog(
+            L"login",
+            channel_name +
+                L" sent auxiliary encrypted PeerInfo login response; secondary_file_transfer=" +
+                BoolToLogText(accepted_secondary_file_transfer) +
+                L", fixed_password=" + BoolToLogText(accepted_fixed_password) +
+                L", temporary_password=" + BoolToLogText(accepted_temporary_password));
+
+        std::wstring connected_remote_id;
+        std::wstring connected_remote_name;
+        if (!display_remote_id.empty()) {
+          connected_remote_id = display_remote_id;
+        } else {
+          connected_remote_id = login_request.my_id;
+          connected_remote_name = login_request.my_name;
+        }
+        return run_file_transfer_session_loop(
+            connection,
+            channel_name,
+            connected_remote_id,
+            connected_remote_name,
+            login_request.file_transfer_dir,
+            login_request.file_transfer_show_hidden,
+            session_status);
+      }
+    };
+
     auto open_relay_session =
         [this,
          session_config,
@@ -13106,6 +16770,66 @@ void PortableHostApp::RendezvousWorker() {
           &relay_connection, L"relay session", session_status);
     };
 
+    auto open_auxiliary_relay_session =
+        [this,
+         session_config,
+         run_auxiliary_secure_session_over_connection](
+            const std::wstring& relay_endpoint,
+            const std::wstring& relay_uuid,
+            bool secure,
+            std::wstring* session_status) -> bool {
+      if (IsAuxiliarySessionStopRequested()) {
+        if (session_status != nullptr) {
+          *session_status = L"auxiliary session stop requested before relay connect";
+        }
+        return true;
+      }
+      if (relay_uuid.empty()) {
+        if (session_status != nullptr) {
+          *session_status = L"auxiliary relay uuid is empty";
+        }
+        return false;
+      }
+      if (!secure) {
+        if (session_status != nullptr) {
+          *session_status = L"plain auxiliary relay session is not supported";
+        }
+        return false;
+      }
+      const ParsedHostPort relay_server = ParseHostPort(relay_endpoint, kDefaultRelayServerPort);
+      if (relay_server.host.empty()) {
+        if (session_status != nullptr) {
+          *session_status = L"auxiliary relay_server is empty";
+        }
+        return false;
+      }
+
+      TcpFramedConnection relay_connection;
+      if (!relay_connection.Connect(
+              relay_server.host,
+              relay_server.port,
+              kConnectTimeoutMs,
+              session_status)) {
+        if (session_status != nullptr && !session_status->empty()) {
+          *session_status = L"auxiliary relay tcp connect failed: " + *session_status;
+        }
+        return false;
+      }
+      if (!relay_connection.SendRawFrame(
+              EncodeRequestRelayMessage(relay_uuid, session_config.key),
+              session_status)) {
+        if (session_status != nullptr && !session_status->empty()) {
+          *session_status = L"auxiliary relay RequestRelay send failed: " + *session_status;
+        }
+        return false;
+      }
+      return run_auxiliary_secure_session_over_connection(
+          &relay_connection,
+          L"relay auxiliary session",
+          L"",
+          session_status);
+    };
+
     auto open_relay_session_with_sideband =
         [this, session_id_server, session_config, open_relay_session](
             const std::vector<unsigned char>& socket_addr,
@@ -13144,6 +16868,46 @@ void PortableHostApp::RendezvousWorker() {
         return false;
       }
       return open_relay_session(relay_endpoint, relay_uuid, secure, session_status);
+    };
+
+    auto open_auxiliary_relay_session_with_sideband =
+        [this, session_id_server, session_config, open_auxiliary_relay_session](
+            const std::vector<unsigned char>& socket_addr,
+            const std::wstring& relay_endpoint,
+            const std::wstring& relay_uuid,
+            bool initiate,
+            bool secure,
+            std::wstring* session_status) -> bool {
+      if (IsAuxiliarySessionStopRequested()) {
+        if (session_status != nullptr) {
+          *session_status = L"auxiliary session stop requested before sideband connect";
+        }
+        return true;
+      }
+      TcpFramedConnection hbbs_sideband;
+      if (!hbbs_sideband.Connect(
+              session_id_server.host,
+              session_id_server.port,
+              kConnectTimeoutMs,
+              session_status)) {
+        if (session_status != nullptr && !session_status->empty()) {
+          *session_status = L"auxiliary hbbs tcp sideband connect failed: " + *session_status;
+        }
+        return false;
+      }
+      const std::vector<unsigned char> relay_response = EncodeRelayResponseMessage(
+          socket_addr,
+          relay_endpoint,
+          relay_uuid,
+          session_config.host_id,
+          initiate);
+      if (!hbbs_sideband.SendRawFrame(relay_response, session_status)) {
+        if (session_status != nullptr && !session_status->empty()) {
+          *session_status = L"auxiliary RelayResponse send failed: " + *session_status;
+        }
+        return false;
+      }
+      return open_auxiliary_relay_session(relay_endpoint, relay_uuid, secure, session_status);
     };
 
     auto accept_direct_intranet_session =
@@ -13333,6 +17097,76 @@ void PortableHostApp::RendezvousWorker() {
           session_status);
     };
 
+    auto start_initiated_auxiliary_relay =
+        [this, session_config, open_auxiliary_relay_session_with_sideband](
+            const std::vector<unsigned char>& socket_addr,
+            const std::wstring& requested_relay_server,
+            const std::wstring& trigger_label,
+            std::wstring* session_status) -> bool {
+      if (IsAuxiliarySessionStopRequested()) {
+        if (session_status != nullptr) {
+          *session_status = trigger_label + L": auxiliary session stop requested";
+        }
+        return true;
+      }
+      if (socket_addr.empty()) {
+        if (session_status != nullptr) {
+          *session_status = trigger_label + L": socket_addr is empty";
+        }
+        return false;
+      }
+      std::wstring relay_endpoint = requested_relay_server;
+      if (relay_endpoint.empty()) {
+        relay_endpoint = session_config.relay_server;
+      }
+      if (relay_endpoint.empty()) {
+        if (session_status != nullptr) {
+          *session_status = trigger_label + L": relay server is empty";
+        }
+        return false;
+      }
+      const std::wstring relay_uuid = GenerateSessionUuidText();
+      return open_auxiliary_relay_session_with_sideband(
+          socket_addr,
+          relay_endpoint,
+          relay_uuid,
+          true,
+          true,
+          session_status);
+    };
+
+    auto has_primary_session_or_pending = [this]() -> bool {
+      if (HasActiveSession()) {
+        return true;
+      }
+      Win32LockGuard guard(active_session_mutex_);
+      return pending_session_requested_;
+    };
+
+    auto start_session_or_auxiliary =
+        [this, &has_primary_session_or_pending](
+            const std::wstring& starting_status,
+            bool registered,
+            const std::wstring& failure_prefix,
+            std::function<bool(std::wstring*)> primary_runner,
+            std::function<bool(std::wstring*)> auxiliary_runner) -> bool {
+      if (has_primary_session_or_pending()) {
+        AppendPortableHostLog(
+            L"session",
+            L"routing incoming session request to auxiliary path: " + starting_status);
+        return StartAuxiliarySessionThread(
+            starting_status,
+            registered,
+            failure_prefix,
+            std::move(auxiliary_runner));
+      }
+      return StartActiveSessionThread(
+          starting_status,
+          registered,
+          failure_prefix,
+          std::move(primary_runner));
+    };
+
     auto ensure_direct_access_listener = [&](bool registered) -> bool {
       if (!session_config.direct_access_enabled) {
         close_direct_access_listener();
@@ -13457,13 +17291,15 @@ void PortableHostApp::RendezvousWorker() {
           sizeof(nodelay));
 
       bool session_busy = HasActiveSession();
+      const bool active_running = session_busy;
+      bool pending_requested = false;
       if (!session_busy) {
         Win32LockGuard guard(active_session_mutex_);
-        session_busy = pending_session_requested_;
-      }
-      if (session_busy) {
-        closesocket(accepted);
-        return;
+        pending_requested = pending_session_requested_;
+        session_busy = pending_requested;
+      } else {
+        Win32LockGuard guard(active_session_mutex_);
+        pending_requested = pending_session_requested_;
       }
 
       std::wstring peer_host;
@@ -13477,6 +17313,21 @@ void PortableHostApp::RendezvousWorker() {
               0,
               NI_NUMERICHOST) == 0) {
         peer_host = host.data();
+      }
+      AppendPortableHostLog(
+          L"direct-ip",
+          L"accepted socket from " +
+              (peer_host.empty() ? std::wstring(L"<unknown>") : peer_host) +
+              L" on port " + std::to_wstring(direct_access_listener_port));
+      if (session_busy) {
+        AppendPortableHostLog(
+            L"direct-ip",
+            L"closing accepted socket because session is busy; peer=" +
+                (peer_host.empty() ? std::wstring(L"<unknown>") : peer_host) +
+                L", active_running=" + BoolToLogText(active_running) +
+                L", pending_session_requested=" + BoolToLogText(pending_requested));
+        closesocket(accepted);
+        return;
       }
 
       std::wstring starting_status =
@@ -13504,7 +17355,16 @@ void PortableHostApp::RendezvousWorker() {
                     peer_host,
                     session_status);
               })) {
+        AppendPortableHostLog(
+            L"direct-ip",
+            L"failed to dispatch accepted socket into active session thread; peer=" +
+                (peer_host.empty() ? std::wstring(L"<unknown>") : peer_host));
         closesocket(accepted);
+      } else {
+        AppendPortableHostLog(
+            L"direct-ip",
+            L"accepted socket dispatched into active session thread; peer=" +
+                (peer_host.empty() ? std::wstring(L"<unknown>") : peer_host));
       }
     };
 
@@ -13681,7 +17541,7 @@ void PortableHostApp::RendezvousWorker() {
               std::wstring(L"online, relay request received from hbbs over tcp; opening ") +
               (request_relay.secure ? L"secure" : L"plain") +
               L" relay session (" + relay + L")";
-          if (!StartActiveSessionThread(
+          if (!start_session_or_auxiliary(
                   starting_status,
                   registered,
                   L"RequestRelay tcp session failed: ",
@@ -13690,6 +17550,18 @@ void PortableHostApp::RendezvousWorker() {
                     const std::wstring relay_uuid =
                         request_relay.uuid.empty() ? GenerateSessionUuidText() : request_relay.uuid;
                     return open_relay_session_with_sideband(
+                        request_relay.socket_addr,
+                        relay,
+                        relay_uuid,
+                        false,
+                        request_relay.secure,
+                        session_status);
+                  },
+                  [open_auxiliary_relay_session_with_sideband, request_relay, relay](
+                      std::wstring* session_status) -> bool {
+                    const std::wstring relay_uuid =
+                        request_relay.uuid.empty() ? GenerateSessionUuidText() : request_relay.uuid;
+                    return open_auxiliary_relay_session_with_sideband(
                         request_relay.socket_addr,
                         relay,
                         relay_uuid,
@@ -13712,13 +17584,23 @@ void PortableHostApp::RendezvousWorker() {
               ? std::wstring(L"online, PunchHole requested relay over tcp (") + relay + L")"
               : std::wstring(L"online, PunchHole received from hbbs over tcp; opening relay path (") +
                     relay + L")";
-          if (!StartActiveSessionThread(
+          if (!start_session_or_auxiliary(
                   starting_status,
                   registered,
                   L"PunchHole tcp relay failed: ",
                   [start_initiated_relay, punch_hole, relay](
                       std::wstring* session_status) -> bool {
                     return start_initiated_relay(
+                        punch_hole.socket_addr,
+                        relay,
+                        punch_hole.force_relay
+                            ? L"PunchHole tcp forced relay"
+                            : L"PunchHole tcp relay",
+                        session_status);
+                  },
+                  [start_initiated_auxiliary_relay, punch_hole, relay](
+                      std::wstring* session_status) -> bool {
+                    return start_initiated_auxiliary_relay(
                         punch_hole.socket_addr,
                         relay,
                         punch_hole.force_relay
@@ -13738,13 +17620,21 @@ void PortableHostApp::RendezvousWorker() {
             relay = session_config.relay_server;
           }
           if (relay.empty()) {
-            if (!StartActiveSessionThread(
+            if (!start_session_or_auxiliary(
                     L"online, FetchLocalAddr over tcp requested relay fallback",
                     registered,
                     L"FetchLocalAddr tcp relay failed: ",
                     [start_initiated_relay, fetch_local_addr, relay](
                         std::wstring* session_status) -> bool {
                       return start_initiated_relay(
+                          fetch_local_addr.socket_addr,
+                          relay,
+                          L"FetchLocalAddr tcp relay",
+                          session_status);
+                    },
+                    [start_initiated_auxiliary_relay, fetch_local_addr, relay](
+                        std::wstring* session_status) -> bool {
+                      return start_initiated_auxiliary_relay(
                           fetch_local_addr.socket_addr,
                           relay,
                           L"FetchLocalAddr tcp relay",
@@ -13756,7 +17646,7 @@ void PortableHostApp::RendezvousWorker() {
             const std::wstring starting_status =
                 std::wstring(L"online, FetchLocalAddr received from hbbs over tcp; trying direct intranet path (") +
                 relay + L")";
-            if (!StartActiveSessionThread(
+            if (!start_session_or_auxiliary(
                     starting_status,
                     registered,
                     L"FetchLocalAddr tcp direct+relay failed: ",
@@ -13768,6 +17658,14 @@ void PortableHostApp::RendezvousWorker() {
                         return true;
                       }
                       return start_initiated_relay(
+                          fetch_local_addr.socket_addr,
+                          relay,
+                          L"FetchLocalAddr tcp",
+                          session_status);
+                    },
+                    [start_initiated_auxiliary_relay, fetch_local_addr, relay](
+                        std::wstring* session_status) -> bool {
+                      return start_initiated_auxiliary_relay(
                           fetch_local_addr.socket_addr,
                           relay,
                           L"FetchLocalAddr tcp",
@@ -13942,13 +17840,23 @@ void PortableHostApp::RendezvousWorker() {
                 std::wstring(L"online, relay request received from hbbs; opening ") +
                 (request_relay.secure ? L"secure" : L"plain") +
                 L" relay session (" + relay + L")";
-            if (!StartActiveSessionThread(
+            if (!start_session_or_auxiliary(
                     starting_status,
                     registered,
                     L"relay session setup failed: ",
                     [open_relay_session_with_sideband, request_relay, relay](
                         std::wstring* session_status) -> bool {
                       return open_relay_session_with_sideband(
+                          request_relay.socket_addr,
+                          relay,
+                          request_relay.uuid,
+                          false,
+                          request_relay.secure,
+                          session_status);
+                    },
+                    [open_auxiliary_relay_session_with_sideband, request_relay, relay](
+                        std::wstring* session_status) -> bool {
+                      return open_auxiliary_relay_session_with_sideband(
                           request_relay.socket_addr,
                           relay,
                           request_relay.uuid,
@@ -13970,12 +17878,20 @@ void PortableHostApp::RendezvousWorker() {
             const std::wstring starting_status =
                 std::wstring(L"online, punch hole request received from hbbs; switching to relay fallback (") +
                 relay + L")";
-            if (!StartActiveSessionThread(
+            if (!start_session_or_auxiliary(
                     starting_status,
                     registered,
                     L"punch-hole relay fallback failed: ",
                     [start_initiated_relay, punch_hole, relay](std::wstring* session_status) -> bool {
                       return start_initiated_relay(
+                          punch_hole.socket_addr,
+                          relay,
+                          L"PunchHole",
+                          session_status);
+                    },
+                    [start_initiated_auxiliary_relay, punch_hole, relay](
+                        std::wstring* session_status) -> bool {
+                      return start_initiated_auxiliary_relay(
                           punch_hole.socket_addr,
                           relay,
                           L"PunchHole",
@@ -13996,12 +17912,20 @@ void PortableHostApp::RendezvousWorker() {
               const std::wstring starting_status =
                   std::wstring(L"online, FetchLocalAddr received from hbbs; force relay enabled, switching directly to relay (") +
                   relay + L")";
-              if (!StartActiveSessionThread(
+              if (!start_session_or_auxiliary(
                       starting_status,
                       registered,
                       L"FetchLocalAddr relay fallback failed: ",
                       [start_initiated_relay, fetch_local_addr, relay](std::wstring* session_status) -> bool {
                         return start_initiated_relay(
+                            fetch_local_addr.socket_addr,
+                            relay,
+                            L"FetchLocalAddr",
+                            session_status);
+                      },
+                      [start_initiated_auxiliary_relay, fetch_local_addr, relay](
+                          std::wstring* session_status) -> bool {
+                        return start_initiated_auxiliary_relay(
                             fetch_local_addr.socket_addr,
                             relay,
                             L"FetchLocalAddr",
@@ -14013,7 +17937,7 @@ void PortableHostApp::RendezvousWorker() {
               const std::wstring starting_status =
                   std::wstring(L"online, FetchLocalAddr received from hbbs; trying direct intranet path (") +
                   relay + L")";
-              if (!StartActiveSessionThread(
+              if (!start_session_or_auxiliary(
                       starting_status,
                       registered,
                       L"FetchLocalAddr direct+relay failed: ",
@@ -14025,6 +17949,14 @@ void PortableHostApp::RendezvousWorker() {
                           return true;
                         }
                         return start_initiated_relay(
+                            fetch_local_addr.socket_addr,
+                            relay,
+                            L"FetchLocalAddr",
+                            session_status);
+                      },
+                      [start_initiated_auxiliary_relay, fetch_local_addr, relay](
+                          std::wstring* session_status) -> bool {
+                        return start_initiated_auxiliary_relay(
                             fetch_local_addr.socket_addr,
                             relay,
                             L"FetchLocalAddr",

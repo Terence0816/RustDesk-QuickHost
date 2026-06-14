@@ -240,9 +240,11 @@ class PortableHostApp {
   void ConfigureFixedPassword();
   void ConfigureHostId();
   void ConfigureLanguage();
+  void ShowAboutDialog() const;
   void StartRendezvousWorker();
   void StopRendezvousWorker();
   void StopActiveSession(bool notify_peer = false);
+  void StopAuxiliarySession();
   void ActiveSessionWorker();
   void RendezvousWorker();
   void SetRendezvousStatus(const std::wstring& text, bool registered);
@@ -250,9 +252,18 @@ class PortableHostApp {
   bool IsRendezvousRegistered() const;
   bool HasActiveSession() const;
   bool IsActiveSessionStopRequested() const;
+  bool HasAuxiliarySession() const;
+  bool IsAuxiliarySessionStopRequested() const;
   void RegisterActiveSessionConnection(void* connection);
   void ClearActiveSessionConnection(void* connection);
+  void RegisterAuxiliarySessionConnection(void* connection);
+  void ClearAuxiliarySessionConnection(void* connection);
   bool StartActiveSessionThread(
+      const std::wstring& starting_status,
+      bool registered,
+      const std::wstring& failure_prefix,
+      std::function<bool(std::wstring*)> runner);
+  bool StartAuxiliarySessionThread(
       const std::wstring& starting_status,
       bool registered,
       const std::wstring& failure_prefix,
@@ -357,13 +368,17 @@ class PortableHostApp {
   std::wstring active_session_remote_name_;
   Win32Thread rendezvous_thread_;
   Win32Thread active_session_thread_;
+  Win32Thread auxiliary_session_thread_;
   std::atomic<bool> stop_rendezvous_{false};
   std::atomic<bool> stop_active_session_{false};
+  std::atomic<bool> stop_auxiliary_session_{false};
   std::atomic<bool> active_session_manual_close_requested_{false};
   std::atomic<bool> active_session_running_{false};
+  std::atomic<bool> auxiliary_session_running_{false};
   std::atomic<bool> active_session_connected_{false};
   std::atomic<unsigned long> active_session_generation_{0};
   void* active_session_connection_ = nullptr;
+  void* auxiliary_session_connection_ = nullptr;
   std::function<bool(std::wstring*)> pending_session_runner_;
   std::wstring pending_session_starting_status_;
   std::wstring pending_session_failure_prefix_;
@@ -378,6 +393,8 @@ class PortableHostApp {
   std::wstring incoming_approval_remote_name_;
   mutable Win32Mutex active_session_mutex_;
   mutable Win32Mutex active_session_thread_mutex_;
+  mutable Win32Mutex auxiliary_session_mutex_;
+  mutable Win32Mutex auxiliary_session_thread_mutex_;
   mutable Win32Mutex incoming_approval_mutex_;
   mutable Win32Mutex rendezvous_mutex_;
 };
