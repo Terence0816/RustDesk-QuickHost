@@ -77,7 +77,7 @@ It is rewritten from the ground up in native C++ and is designed for computers t
 * Native C++ Win32 implementation
 * Host-only remote support client
 * Lightweight single executable
-* Supports Windows XP / Windows 7 / Windows 10 / Windows 11
+* Supports Windows XP / Windows 7 / Windows 10 / Windows 11 and WinPE.
 * Tested and confirmed to run and connect successfully in Windows XP / 7 / 10 / 11 PE environments.
 * System tray resident mode
 * Auto start with Windows
@@ -324,7 +324,8 @@ RustDesk QuickHost 是一個輕量化的 **RustDesk 相容 Host-only 被控端�
 * 原生 C++ Win32 實作
 * Host-only 被控端遠端協助工具
 * 輕量化單一執行檔
-* 支援 Windows XP / Windows 7 / Windows 10 / Windows 11
+* 支援 Windows XP / Windows 7 / Windows 10 / Windows 11 與 WinPE。
+* 已實測確認可於 Windows XP / 7 / 10 / 11 PE 環境中執行並成功連線。
 * 支援右下角常駐
 * 支援開機自動啟動
 * 支援固定密碼
