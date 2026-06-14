@@ -41,7 +41,8 @@ It is rewritten from the ground up in native C++ and is designed for computers t
 
 * Initial public release.
 * Native C++ Win32 host-only implementation.
-* Supports Windows XP / Windows 7 / Windows 10 / Windows 11.
+* Supports Windows XP / Windows 7 / Windows 10 / Windows 11 and WinPE.
+* Tested and confirmed to run and connect successfully in Windows XP / 7 / 10 / 11 PE environments.
 * Added system tray resident mode.
 * Added auto start with Windows.
 * Added fixed password support.
@@ -64,6 +65,7 @@ It is rewritten from the ground up in native C++ and is designed for computers t
 ## Suitable Use Cases
 
 * Older Windows systems where many modern remote support tools no longer work.
+* Windows PE maintenance, recovery, or temporary remote support environments.
 * Computers that only need to be remotely controlled.
 * Lightweight portable host-side remote support.
 * Users who want to avoid commercial remote software limits.
@@ -76,6 +78,7 @@ It is rewritten from the ground up in native C++ and is designed for computers t
 * Host-only remote support client
 * Lightweight single executable
 * Supports Windows XP / Windows 7 / Windows 10 / Windows 11
+* Tested and confirmed to run and connect successfully in Windows XP / 7 / 10 / 11 PE environments.
 * System tray resident mode
 * Auto start with Windows
 * Fixed password support
@@ -285,7 +288,8 @@ RustDesk QuickHost 是一個輕量化的 **RustDesk 相容 Host-only 被控端�
 
 * 首次公開版本。
 * 原生 C++ Win32 Host-only 被控端實作。
-* 支援 Windows XP / Windows 7 / Windows 10 / Windows 11。
+* 支援 Windows XP / Windows 7 / Windows 10 / Windows 11 與 WinPE。
+* 已實測確認可於 Windows XP / 7 / 10 / 11 PE 環境中執行並成功連線。
 * 支援右下角常駐。
 * 支援開機自動啟動。
 * 支援固定密碼。
@@ -308,6 +312,7 @@ RustDesk QuickHost 是一個輕量化的 **RustDesk 相容 Host-only 被控端�
 ## 適用情境
 
 * Windows 系統較舊，例如 Windows XP / Windows 7，許多新遠端工具已不支援。
+* Windows PE 維護、救援或臨時遠端協助環境。
 * 只需要「被連線控制」，不需要主控端功能。
 * 想要簡單、輕巧、免安裝的遠端被控端。
 * 受夠商用遠端軟體的帳號、授權、時間或裝置數限制。
