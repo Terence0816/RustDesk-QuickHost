@@ -629,7 +629,7 @@ constexpr int kCliprdrFileContentsRangeFlag = 0x00000002;
 constexpr size_t kClipboardFileTransferChunkSize = 64 * 1024;
 constexpr size_t kFileTransferBlockSize = 128 * 1024;
 constexpr wchar_t kProjectUrl[] = L"https://github.com/Terence0816/RustDesk-QuickHost";
-constexpr wchar_t kAboutDisplayVersion[] = L"1.1.2.0";
+constexpr wchar_t kAboutDisplayVersion[] = L"1.1.2.1";
 constexpr wchar_t kCppHostVersion[] = L"1.1.10-cpp";
 constexpr wchar_t kAppWindowTitle[] = L"RustDeskQS Host";
 constexpr wchar_t kAppWindowClassName[] = L"RustDeskCppPortableHostWindow";
@@ -685,7 +685,7 @@ const LanguageEntry kTraditionalChineseLanguageEntries[] = {
     {L"incoming_dismiss", L"關閉"},
     {L"incoming_accept", L"接受"},
     {L"incoming_question", L"是否接受？"},
-    {L"incoming_body", L"收到新的遠端連入請求，對方想要連入您目前的裝置。"},
+    {L"incoming_body", L"收到遠端連入請求，是否接受？"},
     {L"incoming_unknown_device", L"未知裝置"},
     {L"incoming_rustdesk_id_prefix", L"RustDesk ID"},
 };
@@ -731,7 +731,7 @@ const LanguageEntry kEnglishLanguageEntries[] = {
     {L"incoming_dismiss", L"Close"},
     {L"incoming_accept", L"Accept"},
     {L"incoming_question", L"Accept?"},
-    {L"incoming_body", L"A new remote access request was received. The other side wants to connect to this device."},
+    {L"incoming_body", L"A remote device wants to connect to this device."},
     {L"incoming_unknown_device", L"Unknown Device"},
     {L"incoming_rustdesk_id_prefix", L"RustDesk ID"},
 };
@@ -10795,7 +10795,7 @@ bool PortableHostApp::EnsureIncomingApprovalWindow() {
       CW_USEDEFAULT,
       CW_USEDEFAULT,
       ScaleForSystemDpi(408),
-      ScaleForSystemDpi(244),
+      ScaleForSystemDpi(264),
       nullptr,
       nullptr,
       instance_,
@@ -11333,7 +11333,7 @@ LRESULT PortableHostApp::IncomingApprovalWindowProc(
           dc,
           GetText(
               L"incoming_body",
-              L"\u6536\u5230\u65b0\u7684\u9060\u7aef\u9023\u5165\u8acb\u6c42\uff0c\u5c0d\u65b9\u60f3\u8981\u9023\u5165\u60a8\u76ee\u524d\u7684\u88dd\u7f6e\u3002")
+              L"\u6536\u5230\u9060\u7aef\u9023\u5165\u8acb\u6c42\uff0c\u662f\u5426\u63a5\u53d7\uff1f")
               .c_str(),
           -1,
           &body_rect,
@@ -13979,6 +13979,15 @@ void PortableHostApp::RendezvousWorker() {
             continue;
           }
           if (IsFileTransferReadJobComplete(*job)) {
+            if (!connection->SendFrame(
+                    EncodeFileTransferDoneResponseMessage(job->id, job->file_num),
+                    session_status)) {
+              if (session_status != nullptr && !session_status->empty()) {
+                *session_status =
+                    channel_name + L" file-transfer final done send failed: " + *session_status;
+              }
+              return false;
+            }
             CloseFileTransferHandle(&job->file);
             cursor = read_jobs.erase(cursor);
             continue;
@@ -14054,20 +14063,21 @@ void PortableHostApp::RendezvousWorker() {
           data.resize(read);
           if (read == 0) {
             if (!connection->SendFrame(
-                    EncodeFileTransferDoneResponseMessage(job->id, job->file_num),
+                    EncodeFileTransferBlockResponseMessage(
+                        job->id,
+                        job->file_num,
+                        std::vector<unsigned char>(),
+                        false,
+                        0U),
                     session_status)) {
               if (session_status != nullptr && !session_status->empty()) {
                 *session_status =
-                    channel_name + L" file-transfer done send failed: " + *session_status;
+                    channel_name + L" file-transfer eof block send failed: " + *session_status;
               }
               return false;
             }
             AdvanceFileTransferReadJob(job.get());
-            if (IsFileTransferReadJobComplete(*job)) {
-              cursor = read_jobs.erase(cursor);
-            } else {
-              ++cursor;
-            }
+            ++cursor;
             continue;
           }
 
@@ -14596,20 +14606,36 @@ void PortableHostApp::RendezvousWorker() {
               if (job_cursor == write_jobs.end() || job_cursor->second == nullptr) {
                 break;
               }
+              FileTransferWriteJob* const job = job_cursor->second.get();
+              const int file_count = static_cast<int>(job->files.size());
+              const bool whole_job_done =
+                  response.done.file_num < 0 || response.done.file_num >= file_count ||
+                  job->current_file_num == -1 ||
+                  response.done.file_num != job->current_file_num;
               std::wstring write_error;
-              if (!PrepareFileTransferWriteTarget(
-                      job_cursor->second.get(),
-                      response.done.file_num,
-                      &write_error) ||
-                  !FinalizeFileTransferWriteCurrentFile(job_cursor->second.get(), &write_error)) {
+              if ((!whole_job_done &&
+                   (!PrepareFileTransferWriteTarget(job, response.done.file_num, &write_error) ||
+                    !FinalizeFileTransferWriteCurrentFile(job, &write_error))) ||
+                  (whole_job_done &&
+                   !FinalizeFileTransferWriteCurrentFile(job, &write_error))) {
                 if (!send_file_transfer_error(response.done.id, response.done.file_num, write_error)) {
                   return false;
                 }
                 erase_write_job(response.done.id, true);
                 break;
               }
-              if (response.done.file_num + 1 >=
-                  static_cast<int>(job_cursor->second->files.size())) {
+              if (!connection->SendFrame(
+                      EncodeFileTransferDoneResponseMessage(
+                          response.done.id,
+                          response.done.file_num),
+                      session_status)) {
+                if (session_status != nullptr && !session_status->empty()) {
+                  *session_status =
+                      channel_name + L" file-transfer completion ack failed: " + *session_status;
+                }
+                return false;
+              }
+              if (whole_job_done || response.done.file_num + 1 >= file_count) {
                 erase_write_job(response.done.id, false);
               }
               break;
