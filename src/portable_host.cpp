@@ -629,8 +629,8 @@ constexpr int kCliprdrFileContentsRangeFlag = 0x00000002;
 constexpr size_t kClipboardFileTransferChunkSize = 64 * 1024;
 constexpr size_t kFileTransferBlockSize = 128 * 1024;
 constexpr wchar_t kProjectUrl[] = L"https://github.com/Terence0816/RustDesk-QuickHost";
-constexpr wchar_t kAboutDisplayVersion[] = L"1.1.2.2";
-constexpr wchar_t kCppHostVersion[] = L"1.1.10-cpp";
+constexpr wchar_t kAboutDisplayVersion[] = L"1.1.2.3";
+constexpr wchar_t kCppHostVersion[] = L"1.3.0-cpp";
 constexpr wchar_t kAppWindowTitle[] = L"RustDeskQS Host";
 constexpr wchar_t kAppWindowClassName[] = L"RustDeskCppPortableHostWindow";
 constexpr wchar_t kStartupRunKeyPath[] =
@@ -1571,6 +1571,15 @@ struct ClipboardMessageData {
   std::wstring special_name;
 };
 
+struct FormattedTextClipboardContent {
+  bool has_text = false;
+  std::wstring text;
+  bool has_html = false;
+  std::vector<unsigned char> html;
+  bool has_rtf = false;
+  std::vector<unsigned char> rtf;
+};
+
 enum class CliprdrMessageKind {
   kNone,
   kReady,
@@ -1690,6 +1699,13 @@ struct ClipboardStagedFileDescriptor {
   uint64_t size = 0;
   bool is_directory = false;
   bool is_top_level = false;
+};
+
+struct LocalClipboardFileDescriptor {
+  FILEDESCRIPTORW descriptor = {};
+  std::wstring absolute_path;
+  uint64_t size = 0;
+  bool is_directory = false;
 };
 
 struct PendingFileClipboardTransfer {
@@ -5720,7 +5736,7 @@ std::vector<unsigned char> EncodeRelayResponseMessage(
       AppendStringField(4U, WideToUtf8(host_id), &relay_response);
     }
   }
-  AppendStringField(7U, "1.1.10-cpp", &relay_response);
+  AppendStringField(7U, WideToUtf8(kCppHostVersion), &relay_response);
 
   std::vector<unsigned char> message;
   AppendLengthDelimitedField(19U, relay_response, &message);
@@ -5739,7 +5755,7 @@ std::vector<unsigned char> EncodeLocalAddrMessage(
     AppendStringField(3U, WideToUtf8(relay_server), &local_addr);
   }
   AppendStringField(4U, WideToUtf8(host_id), &local_addr);
-  AppendStringField(5U, "1.1.10-cpp", &local_addr);
+  AppendStringField(5U, WideToUtf8(kCppHostVersion), &local_addr);
 
   std::vector<unsigned char> message;
   AppendLengthDelimitedField(13U, local_addr, &message);
@@ -6023,6 +6039,670 @@ bool GetClipboardPayloadBytes(
 bool ExtractClipboardWideText(
     const ClipboardMessageData& clipboard,
     std::wstring* text,
+    std::wstring* error_text);
+
+bool CompressZstdBytes(
+    const std::vector<unsigned char>& plain,
+    std::vector<unsigned char>* compressed,
+    std::wstring* error_text) {
+  compressed->clear();
+  if (plain.empty()) {
+    return true;
+  }
+
+  const size_t bound = ZSTD_compressBound(plain.size());
+  if (bound == 0) {
+    if (error_text != nullptr) {
+      *error_text = L"zstd compress bound failed";
+    }
+    return false;
+  }
+
+  compressed->resize(bound);
+  const size_t compressed_size = ZSTD_compress(
+      compressed->data(),
+      compressed->size(),
+      plain.data(),
+      plain.size(),
+      1);
+  if (ZSTD_isError(compressed_size) != 0) {
+    compressed->clear();
+    if (error_text != nullptr) {
+      *error_text = L"zstd compress failed";
+    }
+    return false;
+  }
+  compressed->resize(compressed_size);
+  return true;
+}
+
+UINT GetHtmlClipboardFormat() {
+  static const UINT format = RegisterClipboardFormatW(L"HTML Format");
+  return format;
+}
+
+UINT GetRtfClipboardFormat() {
+  static const UINT format = RegisterClipboardFormatW(L"text/richtext");
+  return format;
+}
+
+UINT GetLegacyRtfClipboardFormat() {
+  static const UINT format = RegisterClipboardFormatW(L"Rich Text Format");
+  return format;
+}
+
+void TrimTrailingZeroBytes(std::vector<unsigned char>* bytes);
+
+bool LooksLikeCfHtmlPayload(const std::vector<unsigned char>& bytes) {
+  if (bytes.size() < 32U) {
+    return false;
+  }
+  const std::string text(bytes.begin(), bytes.end());
+  return text.find("Version:") == 0 &&
+         text.find("StartHTML:") != std::string::npos;
+}
+
+bool TryParseCfHtmlOffset(
+    const std::string& html,
+    const char* label,
+    size_t* value) {
+  const size_t label_pos = html.find(label);
+  if (label_pos == std::string::npos) {
+    return false;
+  }
+  size_t digits_pos = label_pos + std::strlen(label);
+  while (digits_pos < html.size() &&
+         (html[digits_pos] == ' ' || html[digits_pos] == '\t')) {
+    ++digits_pos;
+  }
+  size_t digits_end = digits_pos;
+  while (digits_end < html.size() &&
+         html[digits_end] >= '0' && html[digits_end] <= '9') {
+    ++digits_end;
+  }
+  if (digits_end == digits_pos) {
+    return false;
+  }
+  *value = static_cast<size_t>(
+      std::strtoull(html.substr(digits_pos, digits_end - digits_pos).c_str(),
+                    nullptr,
+                    10));
+  return true;
+}
+
+std::string FormatCfHtmlOffset(size_t value) {
+  std::string digits = std::to_string(value);
+  if (digits.size() < 10U) {
+    digits.insert(digits.begin(), 10U - digits.size(), '0');
+  }
+  return digits;
+}
+
+bool ExtractCfHtmlTransferBytes(
+    const std::vector<unsigned char>& cf_html,
+    std::vector<unsigned char>* html,
+    std::wstring* error_text) {
+  html->clear();
+  if (!LooksLikeCfHtmlPayload(cf_html)) {
+    *html = cf_html;
+    return true;
+  }
+
+  const std::string payload(cf_html.begin(), cf_html.end());
+  size_t start_fragment = 0;
+  size_t end_fragment = 0;
+  bool have_fragment =
+      TryParseCfHtmlOffset(payload, "StartFragment:", &start_fragment) &&
+      TryParseCfHtmlOffset(payload, "EndFragment:", &end_fragment);
+  size_t start_html = 0;
+  size_t end_html = 0;
+  bool have_html =
+      TryParseCfHtmlOffset(payload, "StartHTML:", &start_html) &&
+      TryParseCfHtmlOffset(payload, "EndHTML:", &end_html);
+
+  size_t start = 0;
+  size_t end = 0;
+  if (have_fragment) {
+    start = start_fragment;
+    end = end_fragment;
+  } else if (have_html) {
+    start = start_html;
+    end = end_html;
+  } else {
+    if (error_text != nullptr) {
+      *error_text = L"CF_HTML offsets were missing";
+    }
+    return false;
+  }
+
+  if (start > end || end > cf_html.size()) {
+    if (error_text != nullptr) {
+      *error_text = L"CF_HTML offsets were invalid";
+    }
+    return false;
+  }
+  html->assign(cf_html.begin() + static_cast<std::ptrdiff_t>(start),
+               cf_html.begin() + static_cast<std::ptrdiff_t>(end));
+  TrimTrailingZeroBytes(html);
+  return true;
+}
+
+std::vector<unsigned char> BuildCfHtmlClipboardPayload(
+    const std::vector<unsigned char>& html_bytes) {
+  if (LooksLikeCfHtmlPayload(html_bytes)) {
+    return html_bytes;
+  }
+
+  const std::string fragment(html_bytes.begin(), html_bytes.end());
+  const std::string version = "Version:0.9";
+  const std::string start_html_label = "\r\nStartHTML:";
+  const std::string end_html_label = "\r\nEndHTML:";
+  const std::string start_fragment_label = "\r\nStartFragment:";
+  const std::string end_fragment_label = "\r\nEndFragment:";
+  const std::string body_header =
+      "\r\n<html>\r\n<body>\r\n<!--StartFragment-->\r\n";
+  const std::string body_footer =
+      "\r\n<!--EndFragment-->\r\n</body>\r\n</html>";
+  const size_t header_size =
+      version.size() +
+      start_html_label.size() + 10U +
+      end_html_label.size() + 10U +
+      start_fragment_label.size() + 10U +
+      end_fragment_label.size() + 10U;
+  const size_t start_html = header_size + 2U;
+  const size_t start_fragment = header_size + body_header.size();
+  const size_t end_fragment = start_fragment + fragment.size();
+  const size_t end_html = end_fragment + body_footer.size();
+
+  const std::string cf_html =
+      version +
+      start_html_label + FormatCfHtmlOffset(start_html) +
+      end_html_label + FormatCfHtmlOffset(end_html) +
+      start_fragment_label + FormatCfHtmlOffset(start_fragment) +
+      end_fragment_label + FormatCfHtmlOffset(end_fragment) +
+      body_header + fragment + body_footer;
+  return std::vector<unsigned char>(cf_html.begin(), cf_html.end());
+}
+
+void TrimTrailingZeroBytes(std::vector<unsigned char>* bytes) {
+  while (!bytes->empty() && bytes->back() == 0) {
+    bytes->pop_back();
+  }
+}
+
+bool CopyClipboardHandleBytes(
+    HANDLE handle,
+    std::vector<unsigned char>* bytes,
+    std::wstring* error_text) {
+  bytes->clear();
+  if (handle == nullptr) {
+    if (error_text != nullptr) {
+      *error_text = L"clipboard data handle was null";
+    }
+    return false;
+  }
+
+  const SIZE_T size = GlobalSize(handle);
+  if (size == 0) {
+    if (error_text != nullptr) {
+      *error_text = L"GlobalSize failed for clipboard data";
+    }
+    return false;
+  }
+
+  const unsigned char* locked =
+      static_cast<const unsigned char*>(GlobalLock(handle));
+  if (locked == nullptr) {
+    if (error_text != nullptr) {
+      *error_text = L"GlobalLock failed for clipboard data";
+    }
+    return false;
+  }
+
+  bytes->assign(locked, locked + size);
+  GlobalUnlock(handle);
+  return true;
+}
+
+std::wstring BuildFormattedTextClipboardSignature(
+    const FormattedTextClipboardContent& content) {
+  std::vector<unsigned char> canonical;
+  if (content.has_text) {
+    const std::string utf8_text = WideToUtf8(content.text);
+    AppendVarintField(1U, 1U, &canonical);
+    AppendBytesField(
+        2U,
+        std::vector<unsigned char>(utf8_text.begin(), utf8_text.end()),
+        &canonical);
+  }
+  if (content.has_html) {
+    AppendVarintField(3U, 1U, &canonical);
+    AppendBytesField(4U, content.html, &canonical);
+  }
+  if (content.has_rtf) {
+    AppendVarintField(5U, 1U, &canonical);
+    AppendBytesField(6U, content.rtf, &canonical);
+  }
+  if (canonical.empty()) {
+    return std::wstring();
+  }
+  return BytesToHex(ComputeSha256(canonical));
+}
+
+ClipboardMessageData BuildClipboardMessageData(
+    int format,
+    const std::vector<unsigned char>& content,
+    const std::wstring& special_name = std::wstring(),
+    int width = 0,
+    int height = 0) {
+  ClipboardMessageData clipboard;
+  clipboard.format = format;
+  clipboard.special_name = special_name;
+  clipboard.width = width;
+  clipboard.height = height;
+
+  std::vector<unsigned char> compressed;
+  if (CompressZstdBytes(content, &compressed, nullptr) &&
+      !compressed.empty() &&
+      compressed.size() < content.size()) {
+    clipboard.compress = true;
+    clipboard.content = std::move(compressed);
+  } else {
+    clipboard.compress = false;
+    clipboard.content = content;
+  }
+  return clipboard;
+}
+
+std::vector<unsigned char> EncodeClipboardPayloadMessage(
+    const ClipboardMessageData& clipboard) {
+  std::vector<unsigned char> payload;
+  AppendVarintField(1U, clipboard.compress ? 1U : 0U, &payload);
+  AppendBytesField(2U, clipboard.content, &payload);
+  if (clipboard.width != 0) {
+    AppendVarintField(3U, static_cast<uint64_t>(clipboard.width), &payload);
+  }
+  if (clipboard.height != 0) {
+    AppendVarintField(4U, static_cast<uint64_t>(clipboard.height), &payload);
+  }
+  AppendVarintField(5U, static_cast<uint64_t>(clipboard.format), &payload);
+  if (!clipboard.special_name.empty()) {
+    AppendStringField(6U, WideToUtf8(clipboard.special_name), &payload);
+  }
+  return payload;
+}
+
+std::vector<unsigned char> EncodeSingleClipboardMessage(
+    const ClipboardMessageData& clipboard) {
+  std::vector<unsigned char> message;
+  AppendLengthDelimitedField(
+      16U,
+      EncodeClipboardPayloadMessage(clipboard),
+      &message);
+  return message;
+}
+
+std::vector<unsigned char> EncodeMultiClipboardMessage(
+    const std::vector<ClipboardMessageData>& clipboards) {
+  std::vector<unsigned char> multi_clipboards;
+  for (const ClipboardMessageData& clipboard : clipboards) {
+    AppendLengthDelimitedField(
+        1U,
+        EncodeClipboardPayloadMessage(clipboard),
+        &multi_clipboards);
+  }
+
+  std::vector<unsigned char> message;
+  AppendLengthDelimitedField(28U, multi_clipboards, &message);
+  return message;
+}
+
+bool BuildFormattedTextClipboardMessages(
+    const FormattedTextClipboardContent& content,
+    std::vector<ClipboardMessageData>* clipboards) {
+  if (clipboards == nullptr) {
+    return false;
+  }
+  clipboards->clear();
+
+  if (content.has_rtf && !content.rtf.empty()) {
+    clipboards->push_back(
+        BuildClipboardMessageData(kClipboardFormatRtf, content.rtf));
+  }
+  if (content.has_html && !content.html.empty()) {
+    clipboards->push_back(
+        BuildClipboardMessageData(kClipboardFormatHtml, content.html));
+  }
+  if (content.has_text) {
+    const std::string utf8_text = WideToUtf8(content.text);
+    clipboards->push_back(BuildClipboardMessageData(
+        kClipboardFormatText,
+        std::vector<unsigned char>(utf8_text.begin(), utf8_text.end())));
+  }
+  return !clipboards->empty();
+}
+
+bool CaptureFormattedTextClipboardContent(
+    FormattedTextClipboardContent* content,
+    std::wstring* signature,
+    std::wstring* error_text) {
+  if (content == nullptr) {
+    if (error_text != nullptr) {
+      *error_text = L"formatted clipboard target was null";
+    }
+    return false;
+  }
+
+  *content = FormattedTextClipboardContent();
+  if (signature != nullptr) {
+    signature->clear();
+  }
+
+  if (!OpenClipboard(nullptr)) {
+    if (error_text != nullptr) {
+      *error_text = L"OpenClipboard failed";
+    }
+    return false;
+  }
+
+  const auto close_clipboard = []() {
+    CloseClipboard();
+  };
+
+  HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+  if (handle != nullptr) {
+    const wchar_t* locked = static_cast<const wchar_t*>(GlobalLock(handle));
+    if (locked != nullptr) {
+      content->text = locked;
+      content->has_text = true;
+      GlobalUnlock(handle);
+    }
+  } else {
+    handle = GetClipboardData(CF_TEXT);
+    if (handle != nullptr) {
+      const char* locked = static_cast<const char*>(GlobalLock(handle));
+      if (locked != nullptr) {
+        content->text = AnsiToWideCompat(locked);
+        content->has_text = true;
+        GlobalUnlock(handle);
+      }
+    }
+  }
+
+  std::vector<unsigned char> html_bytes;
+  const UINT html_format = GetHtmlClipboardFormat();
+  if (html_format != 0) {
+    handle = GetClipboardData(html_format);
+    if (handle != nullptr &&
+        CopyClipboardHandleBytes(handle, &html_bytes, nullptr)) {
+      TrimTrailingZeroBytes(&html_bytes);
+      if (!html_bytes.empty()) {
+        std::vector<unsigned char> transfer_html;
+        if (ExtractCfHtmlTransferBytes(html_bytes, &transfer_html, nullptr) &&
+            !transfer_html.empty()) {
+          content->html = std::move(transfer_html);
+          content->has_html = true;
+        }
+      }
+    }
+  }
+
+  std::vector<unsigned char> rtf_bytes;
+  UINT rtf_formats[2] = {GetLegacyRtfClipboardFormat(), GetRtfClipboardFormat()};
+  for (size_t rtf_index = 0; rtf_index < 2U && !content->has_rtf; ++rtf_index) {
+    const UINT rtf_format = rtf_formats[rtf_index];
+    if (rtf_format == 0) {
+      continue;
+    }
+    handle = GetClipboardData(rtf_format);
+    if (handle == nullptr ||
+        !CopyClipboardHandleBytes(handle, &rtf_bytes, nullptr)) {
+      continue;
+    }
+    TrimTrailingZeroBytes(&rtf_bytes);
+    if (!rtf_bytes.empty()) {
+      content->rtf = std::move(rtf_bytes);
+      content->has_rtf = true;
+    }
+  }
+
+  close_clipboard();
+  if (!content->has_text && !content->has_html && !content->has_rtf) {
+    if (error_text != nullptr) {
+      *error_text = L"clipboard does not contain supported text formats";
+    }
+    return false;
+  }
+
+  if (signature != nullptr) {
+    *signature = BuildFormattedTextClipboardSignature(*content);
+  }
+  return true;
+}
+
+bool DecodeFormattedTextClipboardContent(
+    const std::vector<ClipboardMessageData>& clipboards,
+    FormattedTextClipboardContent* content,
+    std::wstring* signature,
+    std::wstring* error_text) {
+  if (content == nullptr) {
+    if (error_text != nullptr) {
+      *error_text = L"formatted clipboard target was null";
+    }
+    return false;
+  }
+
+  *content = FormattedTextClipboardContent();
+  if (signature != nullptr) {
+    signature->clear();
+  }
+
+  bool found_supported_format = false;
+  std::wstring last_error;
+  for (const ClipboardMessageData& clipboard : clipboards) {
+    if (clipboard.format == kClipboardFormatText) {
+      std::wstring text;
+      if (ExtractClipboardWideText(clipboard, &text, &last_error)) {
+        content->text = std::move(text);
+        content->has_text = true;
+        found_supported_format = true;
+      }
+      continue;
+    }
+
+    const bool is_html =
+        clipboard.format == kClipboardFormatHtml ||
+        (clipboard.format == kClipboardFormatSpecial &&
+         _wcsicmp(clipboard.special_name.c_str(), L"HTML Format") == 0);
+    const bool is_rtf =
+        clipboard.format == kClipboardFormatRtf ||
+        (clipboard.format == kClipboardFormatSpecial &&
+         (_wcsicmp(clipboard.special_name.c_str(), L"Rich Text Format") == 0 ||
+          _wcsicmp(clipboard.special_name.c_str(), L"text/richtext") == 0));
+    if (!is_html && !is_rtf) {
+      continue;
+    }
+
+    std::vector<unsigned char> bytes;
+    if (!GetClipboardPayloadBytes(clipboard, &bytes, &last_error)) {
+      continue;
+    }
+    TrimTrailingZeroBytes(&bytes);
+    if (is_html) {
+      std::vector<unsigned char> transfer_html;
+      if (ExtractCfHtmlTransferBytes(bytes, &transfer_html, nullptr)) {
+        content->html = std::move(transfer_html);
+        content->has_html = !content->html.empty();
+      } else {
+        content->html = std::move(bytes);
+        content->has_html = !content->html.empty();
+      }
+    } else {
+      content->rtf = std::move(bytes);
+      content->has_rtf = true;
+    }
+    found_supported_format = true;
+  }
+
+  if (!found_supported_format) {
+    if (error_text != nullptr && !last_error.empty()) {
+      *error_text = last_error;
+    }
+    return false;
+  }
+
+  if (signature != nullptr) {
+    *signature = BuildFormattedTextClipboardSignature(*content);
+  }
+  return true;
+}
+
+bool SetClipboardBinaryFormatData(
+    UINT format,
+    const std::vector<unsigned char>& bytes,
+    bool append_nul,
+    std::wstring* error_text) {
+  const SIZE_T extra = append_nul ? 1U : 0U;
+  HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes.size() + extra);
+  if (memory == nullptr) {
+    if (error_text != nullptr) {
+      *error_text = L"GlobalAlloc failed for clipboard binary data";
+    }
+    return false;
+  }
+
+  unsigned char* locked = static_cast<unsigned char*>(GlobalLock(memory));
+  if (locked == nullptr) {
+    GlobalFree(memory);
+    if (error_text != nullptr) {
+      *error_text = L"GlobalLock failed for clipboard binary data";
+    }
+    return false;
+  }
+  if (!bytes.empty()) {
+    std::memcpy(locked, bytes.data(), bytes.size());
+  }
+  if (append_nul) {
+    locked[bytes.size()] = 0;
+  }
+  GlobalUnlock(memory);
+
+  if (SetClipboardData(format, memory) == nullptr) {
+    GlobalFree(memory);
+    if (error_text != nullptr) {
+      *error_text = L"SetClipboardData failed for clipboard binary data";
+    }
+    return false;
+  }
+  return true;
+}
+
+bool SetClipboardFormattedTextContent(
+    const FormattedTextClipboardContent& content,
+    std::wstring* error_text) {
+  if (!content.has_text && !content.has_html && !content.has_rtf) {
+    if (error_text != nullptr) {
+      *error_text = L"no supported text formats were provided";
+    }
+    return false;
+  }
+
+  if (!OpenClipboard(nullptr)) {
+    if (error_text != nullptr) {
+      *error_text = L"OpenClipboard failed";
+    }
+    return false;
+  }
+
+  const auto close_clipboard = []() {
+    CloseClipboard();
+  };
+
+  if (!EmptyClipboard()) {
+    close_clipboard();
+    if (error_text != nullptr) {
+      *error_text = L"EmptyClipboard failed";
+    }
+    return false;
+  }
+
+  bool set_any = false;
+  std::wstring first_error;
+
+  if (content.has_rtf && !content.rtf.empty()) {
+    const UINT rtf_formats[2] = {GetLegacyRtfClipboardFormat(), GetRtfClipboardFormat()};
+    for (size_t rtf_index = 0; rtf_index < 2U; ++rtf_index) {
+      const UINT rtf_format = rtf_formats[rtf_index];
+      if (rtf_format == 0) {
+        continue;
+      }
+      std::wstring set_error;
+      if (SetClipboardBinaryFormatData(
+              rtf_format,
+              content.rtf,
+              false,
+              &set_error)) {
+        set_any = true;
+      } else if (first_error.empty()) {
+        first_error = set_error;
+      }
+    }
+  }
+
+  const UINT html_format = GetHtmlClipboardFormat();
+  if (content.has_html && !content.html.empty() && html_format != 0) {
+    std::wstring set_error;
+    if (SetClipboardBinaryFormatData(
+            html_format,
+            BuildCfHtmlClipboardPayload(content.html),
+            false,
+            &set_error)) {
+      set_any = true;
+    } else if (first_error.empty()) {
+      first_error = set_error;
+    }
+  }
+
+  if (content.has_text) {
+    const size_t bytes = (content.text.size() + 1U) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (memory == nullptr) {
+      if (first_error.empty()) {
+        first_error = L"GlobalAlloc failed for clipboard text";
+      }
+    } else {
+      void* locked = GlobalLock(memory);
+      if (locked == nullptr) {
+        GlobalFree(memory);
+        if (first_error.empty()) {
+          first_error = L"GlobalLock failed for clipboard text";
+        }
+      } else {
+        std::memcpy(locked, content.text.c_str(), bytes);
+        GlobalUnlock(memory);
+        if (SetClipboardData(CF_UNICODETEXT, memory) == nullptr) {
+          GlobalFree(memory);
+          if (first_error.empty()) {
+            first_error = L"SetClipboardData(CF_UNICODETEXT) failed";
+          }
+        } else {
+          set_any = true;
+        }
+      }
+    }
+  }
+
+  close_clipboard();
+  if (!set_any && error_text != nullptr) {
+    *error_text =
+        first_error.empty() ? L"failed to apply clipboard formats" : first_error;
+  }
+  return set_any;
+}
+
+bool ExtractClipboardWideText(
+    const ClipboardMessageData& clipboard,
+    std::wstring* text,
     std::wstring* error_text) {
   if (clipboard.format != kClipboardFormatText) {
     return false;
@@ -6152,17 +6832,421 @@ bool GetClipboardUnicodeText(std::wstring* text, std::wstring* error_text) {
 
 std::vector<unsigned char> EncodeClipboardTextMessage(const std::wstring& text) {
   const std::string utf8_text = WideToUtf8(text);
-  std::vector<unsigned char> clipboard;
-  AppendVarintField(1U, 0U, &clipboard);
-  AppendBytesField(
-      2U,
-      std::vector<unsigned char>(utf8_text.begin(), utf8_text.end()),
-      &clipboard);
-  AppendVarintField(5U, static_cast<uint64_t>(kClipboardFormatText), &clipboard);
+  return EncodeSingleClipboardMessage(BuildClipboardMessageData(
+      kClipboardFormatText,
+      std::vector<unsigned char>(utf8_text.begin(), utf8_text.end())));
+}
+
+bool GetClipboardFileDropList(
+    std::vector<std::wstring>* file_paths,
+    std::wstring* error_text) {
+  if (file_paths == nullptr) {
+    if (error_text != nullptr) {
+      *error_text = L"clipboard file path target was null";
+    }
+    return false;
+  }
+  file_paths->clear();
+
+  if (!OpenClipboard(nullptr)) {
+    if (error_text != nullptr) {
+      *error_text = L"OpenClipboard failed";
+    }
+    return false;
+  }
+
+  const auto close_clipboard = []() {
+    CloseClipboard();
+  };
+
+  HDROP drop_handle = reinterpret_cast<HDROP>(GetClipboardData(CF_HDROP));
+  if (drop_handle == nullptr) {
+    close_clipboard();
+    if (error_text != nullptr) {
+      *error_text = L"clipboard does not contain file drop list";
+    }
+    return false;
+  }
+
+  const UINT item_count = DragQueryFileW(drop_handle, 0xFFFFFFFFu, nullptr, 0);
+  file_paths->reserve(item_count);
+  for (UINT index = 0; index < item_count; ++index) {
+    const UINT path_length = DragQueryFileW(drop_handle, index, nullptr, 0);
+    if (path_length == 0) {
+      continue;
+    }
+    std::wstring file_path(path_length + 1, L'\0');
+    const UINT copied = DragQueryFileW(
+        drop_handle,
+        index,
+        &file_path[0],
+        static_cast<UINT>(file_path.size()));
+    file_path.resize(copied);
+    if (!file_path.empty()) {
+      file_paths->push_back(std::move(file_path));
+    }
+  }
+
+  close_clipboard();
+  if (file_paths->empty()) {
+    if (error_text != nullptr) {
+      *error_text = L"clipboard file drop list was empty";
+    }
+    return false;
+  }
+  return true;
+}
+
+std::wstring GetClipboardPathLeafName(const std::wstring& path) {
+  const size_t end = path.find_last_not_of(L"\\/");
+  if (end == std::wstring::npos) {
+    return L"clipboard_item";
+  }
+  const size_t separator = path.find_last_of(L"\\/", end);
+  const size_t start = separator == std::wstring::npos ? 0 : separator + 1;
+  const std::wstring leaf = path.substr(start, end - start + 1);
+  return leaf.empty() ? L"clipboard_item" : leaf;
+}
+
+std::wstring JoinClipboardRelativePath(
+    const std::wstring& base,
+    const std::wstring& component) {
+  if (base.empty()) {
+    return component;
+  }
+  if (component.empty()) {
+    return base;
+  }
+  return base + L"\\" + component;
+}
+
+void AppendLocalClipboardFileDescriptor(
+    const WIN32_FILE_ATTRIBUTE_DATA& metadata,
+    const std::wstring& absolute_path,
+    const std::wstring& relative_path,
+    std::vector<LocalClipboardFileDescriptor>* entries) {
+  if (entries == nullptr) {
+    return;
+  }
+  LocalClipboardFileDescriptor entry;
+  entry.absolute_path = absolute_path;
+  entry.is_directory = (metadata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  entry.size = (static_cast<uint64_t>(metadata.nFileSizeHigh) << 32ULL) |
+               static_cast<uint64_t>(metadata.nFileSizeLow);
+  entry.descriptor.dwFlags = FD_ATTRIBUTES | FD_WRITESTIME;
+  entry.descriptor.dwFileAttributes = metadata.dwFileAttributes;
+  entry.descriptor.ftLastWriteTime = metadata.ftLastWriteTime;
+  if (!entry.is_directory) {
+    entry.descriptor.dwFlags |= FD_FILESIZE;
+    entry.descriptor.nFileSizeHigh = metadata.nFileSizeHigh;
+    entry.descriptor.nFileSizeLow = metadata.nFileSizeLow;
+  }
+  wcsncpy_s(
+      entry.descriptor.cFileName,
+      _countof(entry.descriptor.cFileName),
+      relative_path.c_str(),
+      _TRUNCATE);
+  entries->push_back(std::move(entry));
+}
+
+bool CollectLocalClipboardFileDescriptorsRecursive(
+    const std::wstring& absolute_path,
+    const std::wstring& relative_path,
+    std::vector<LocalClipboardFileDescriptor>* entries,
+    std::wstring* error_text) {
+  WIN32_FILE_ATTRIBUTE_DATA metadata = {};
+  if (!GetFileAttributesExW(
+          absolute_path.c_str(),
+          GetFileExInfoStandard,
+          &metadata)) {
+    if (error_text != nullptr) {
+      *error_text = L"GetFileAttributesExW failed while reading local clipboard file";
+    }
+    return false;
+  }
+
+  if ((metadata.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+    return true;
+  }
+
+  AppendLocalClipboardFileDescriptor(metadata, absolute_path, relative_path, entries);
+
+  if ((metadata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    return true;
+  }
+
+  std::wstring pattern = absolute_path;
+  if (!pattern.empty() && pattern.back() != L'\\') {
+    pattern += L"\\";
+  }
+  pattern += L"*";
+
+  WIN32_FIND_DATAW find_data = {};
+  HANDLE find_handle = FindFirstFileW(pattern.c_str(), &find_data);
+  if (find_handle == INVALID_HANDLE_VALUE) {
+    const DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND) {
+      return true;
+    }
+    if (error_text != nullptr) {
+      *error_text =
+          L"FindFirstFileW failed while enumerating local clipboard directory";
+    }
+    return false;
+  }
+
+  do {
+    const std::wstring child_name(find_data.cFileName);
+    if (child_name == L"." || child_name == L"..") {
+      continue;
+    }
+    std::wstring child_absolute_path = absolute_path;
+    if (!child_absolute_path.empty() && child_absolute_path.back() != L'\\') {
+      child_absolute_path += L"\\";
+    }
+    child_absolute_path += child_name;
+    const std::wstring child_relative_path =
+        JoinClipboardRelativePath(relative_path, child_name);
+    if (!CollectLocalClipboardFileDescriptorsRecursive(
+            child_absolute_path,
+            child_relative_path,
+            entries,
+            error_text)) {
+      FindClose(find_handle);
+      return false;
+    }
+  } while (FindNextFileW(find_handle, &find_data) != FALSE);
+
+  FindClose(find_handle);
+  return true;
+}
+
+bool BuildLocalClipboardFileDescriptorPayload(
+    const std::vector<LocalClipboardFileDescriptor>& entries,
+    std::vector<unsigned char>* payload,
+    std::wstring* error_text) {
+  if (payload == nullptr) {
+    if (error_text != nullptr) {
+      *error_text = L"clipboard file descriptor payload target was null";
+    }
+    return false;
+  }
+  payload->clear();
+  if (entries.empty()) {
+    if (error_text != nullptr) {
+      *error_text = L"local clipboard file descriptor list was empty";
+    }
+    return false;
+  }
+
+  const size_t header_size = offsetof(FILEGROUPDESCRIPTORW, fgd);
+  const size_t total_bytes =
+      header_size + entries.size() * sizeof(FILEDESCRIPTORW);
+  payload->assign(total_bytes, 0);
+
+  const UINT count = static_cast<UINT>(entries.size());
+  std::memcpy(payload->data(), &count, sizeof(count));
+  for (size_t index = 0; index < entries.size(); ++index) {
+    std::memcpy(
+        payload->data() + header_size + index * sizeof(FILEDESCRIPTORW),
+        &entries[index].descriptor,
+        sizeof(FILEDESCRIPTORW));
+  }
+  return true;
+}
+
+bool CaptureLocalClipboardFileDescriptors(
+    std::vector<LocalClipboardFileDescriptor>* entries,
+    std::vector<unsigned char>* descriptor_payload,
+    std::wstring* signature,
+    std::wstring* error_text) {
+  if (entries == nullptr || descriptor_payload == nullptr || signature == nullptr) {
+    if (error_text != nullptr) {
+      *error_text = L"local clipboard capture target was null";
+    }
+    return false;
+  }
+  entries->clear();
+  descriptor_payload->clear();
+  signature->clear();
+
+  std::vector<std::wstring> file_paths;
+  if (!GetClipboardFileDropList(&file_paths, error_text)) {
+    return false;
+  }
+
+  for (const std::wstring& file_path : file_paths) {
+    if (!signature->empty()) {
+      *signature += L"\n";
+    }
+    *signature += file_path;
+
+    const std::wstring leaf_name = GetClipboardPathLeafName(file_path);
+    if (!CollectLocalClipboardFileDescriptorsRecursive(
+            file_path,
+            leaf_name,
+            entries,
+            error_text)) {
+      entries->clear();
+      descriptor_payload->clear();
+      signature->clear();
+      return false;
+    }
+  }
+
+  if (!BuildLocalClipboardFileDescriptorPayload(*entries, descriptor_payload, error_text)) {
+    entries->clear();
+    descriptor_payload->clear();
+    signature->clear();
+    return false;
+  }
+  return true;
+}
+
+std::vector<unsigned char> EncodeCliprdrFormatListMessage(
+    const std::vector<CliprdrFormatData>& formats) {
+  std::vector<unsigned char> format_list;
+  for (const CliprdrFormatData& format : formats) {
+    std::vector<unsigned char> format_payload;
+    AppendVarintField(2U, static_cast<uint64_t>(format.id), &format_payload);
+    AppendStringField(3U, WideToUtf8(format.format_name), &format_payload);
+    AppendLengthDelimitedField(2U, format_payload, &format_list);
+  }
+
+  std::vector<unsigned char> cliprdr;
+  AppendLengthDelimitedField(2U, format_list, &cliprdr);
 
   std::vector<unsigned char> message;
-  AppendLengthDelimitedField(16U, clipboard, &message);
+  AppendLengthDelimitedField(20U, cliprdr, &message);
   return message;
+}
+
+std::vector<unsigned char> EncodeCliprdrFormatDataResponseMessage(
+    int msg_flags,
+    const std::vector<unsigned char>& payload) {
+  std::vector<unsigned char> response;
+  AppendVarintField(2U, static_cast<uint64_t>(msg_flags), &response);
+  AppendBytesField(3U, payload, &response);
+
+  std::vector<unsigned char> cliprdr;
+  AppendLengthDelimitedField(5U, response, &cliprdr);
+
+  std::vector<unsigned char> message;
+  AppendLengthDelimitedField(20U, cliprdr, &message);
+  return message;
+}
+
+std::vector<unsigned char> EncodeCliprdrFileContentsResponseMessage(
+    int msg_flags,
+    int stream_id,
+    const std::vector<unsigned char>& payload) {
+  std::vector<unsigned char> response;
+  AppendVarintField(3U, static_cast<uint64_t>(msg_flags), &response);
+  AppendVarintField(4U, static_cast<uint64_t>(stream_id), &response);
+  AppendBytesField(5U, payload, &response);
+
+  std::vector<unsigned char> cliprdr;
+  AppendLengthDelimitedField(7U, response, &cliprdr);
+
+  std::vector<unsigned char> message;
+  AppendLengthDelimitedField(20U, cliprdr, &message);
+  return message;
+}
+
+bool BuildLocalClipboardFileContentsPayload(
+    const std::vector<LocalClipboardFileDescriptor>& entries,
+    const CliprdrMessageData& request,
+    std::vector<unsigned char>* payload,
+    std::wstring* error_text) {
+  if (payload == nullptr) {
+    if (error_text != nullptr) {
+      *error_text = L"local clipboard file payload target was null";
+    }
+    return false;
+  }
+  payload->clear();
+
+  if (request.list_index < 0 ||
+      static_cast<size_t>(request.list_index) >= entries.size()) {
+    if (error_text != nullptr) {
+      *error_text = L"local clipboard file index was out of range";
+    }
+    return false;
+  }
+
+  const LocalClipboardFileDescriptor& entry =
+      entries[static_cast<size_t>(request.list_index)];
+  if ((request.dw_flags & kCliprdrFileContentsSizeFlag) != 0) {
+    payload->resize(sizeof(uint64_t), 0);
+    std::memcpy(payload->data(), &entry.size, sizeof(entry.size));
+    return true;
+  }
+
+  if ((request.dw_flags & kCliprdrFileContentsRangeFlag) == 0) {
+    if (error_text != nullptr) {
+      *error_text = L"local clipboard file request did not specify size or range";
+    }
+    return false;
+  }
+
+  if (entry.is_directory) {
+    return true;
+  }
+
+  const uint64_t offset =
+      (static_cast<uint64_t>(static_cast<unsigned long>(request.n_position_high)) << 32ULL) |
+      static_cast<unsigned long>(request.n_position_low);
+  if (offset >= entry.size || request.cb_requested <= 0) {
+    return true;
+  }
+
+  const uint64_t remaining = entry.size - offset;
+  const DWORD bytes_to_read = static_cast<DWORD>(std::min<uint64_t>(
+      remaining,
+      static_cast<uint64_t>(request.cb_requested)));
+  if (bytes_to_read == 0) {
+    return true;
+  }
+
+  HANDLE file = CreateFileW(
+      entry.absolute_path.c_str(),
+      GENERIC_READ,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    if (error_text != nullptr) {
+      *error_text = L"CreateFileW failed for local clipboard source";
+    }
+    return false;
+  }
+
+  LARGE_INTEGER file_offset = {};
+  file_offset.QuadPart = static_cast<LONGLONG>(offset);
+  if (!SetFilePointerEx(file, file_offset, nullptr, FILE_BEGIN)) {
+    CloseHandle(file);
+    if (error_text != nullptr) {
+      *error_text = L"SetFilePointerEx failed for local clipboard source";
+    }
+    return false;
+  }
+
+  payload->resize(bytes_to_read);
+  DWORD bytes_read = 0;
+  const BOOL read_ok =
+      ReadFile(file, payload->data(), bytes_to_read, &bytes_read, nullptr);
+  CloseHandle(file);
+  if (!read_ok) {
+    payload->clear();
+    if (error_text != nullptr) {
+      *error_text = L"ReadFile failed for local clipboard source";
+    }
+    return false;
+  }
+  payload->resize(bytes_read);
+  return true;
 }
 
 std::wstring BuildClipboardStagingRoot(const HostConfig& config) {
@@ -7419,6 +8503,49 @@ std::vector<WORD> FilterCharacterInputModifiers(const std::vector<WORD>& modifie
   return filtered;
 }
 
+void AppendModifierIfMissing(std::vector<WORD>* modifiers, WORD vk) {
+  if (modifiers == nullptr || vk == 0) {
+    return;
+  }
+  if (std::find(modifiers->begin(), modifiers->end(), vk) == modifiers->end()) {
+    modifiers->push_back(vk);
+  }
+}
+
+std::vector<WORD> NormalizeWin2WinHotkeyModifiers(
+    uint32_t hotkey_code,
+    WORD vk,
+    const std::vector<WORD>& modifiers) {
+  std::vector<WORD> effective_modifiers = modifiers;
+  const wchar_t hotkey_char = static_cast<wchar_t>(hotkey_code & 0xFFFFU);
+  if (!IsAsciiPrintableWide(hotkey_char)) {
+    return effective_modifiers;
+  }
+
+  const SHORT vk_pair = VkKeyScanW(hotkey_char);
+  if (vk_pair == -1) {
+    return effective_modifiers;
+  }
+
+  const WORD char_vk = static_cast<WORD>(vk_pair & 0x00FF);
+  if (char_vk == 0 || char_vk != vk) {
+    return effective_modifiers;
+  }
+
+  effective_modifiers = FilterCharacterInputModifiers(modifiers);
+  const BYTE shift_state = static_cast<BYTE>((vk_pair >> 8) & 0x00FF);
+  if ((shift_state & 0x01U) != 0) {
+    AppendModifierIfMissing(&effective_modifiers, VK_SHIFT);
+  }
+  if ((shift_state & 0x02U) != 0) {
+    AppendModifierIfMissing(&effective_modifiers, VK_CONTROL);
+  }
+  if ((shift_state & 0x04U) != 0) {
+    AppendModifierIfMissing(&effective_modifiers, VK_MENU);
+  }
+  return effective_modifiers;
+}
+
 bool TrySendLayoutCharacterPress(
     wchar_t value,
     const std::vector<WORD>& modifiers) {
@@ -7550,13 +8677,15 @@ bool HandleKeyEvent(const KeyEventData& event) {
   if (event.has_win2win_hotkey) {
     const WORD vk = static_cast<WORD>((event.win2win_hotkey >> 16U) & 0xFFFFU);
     if (vk != 0) {
+      const std::vector<WORD> effective_modifiers =
+          NormalizeWin2WinHotkeyModifiers(event.win2win_hotkey, vk, modifiers);
       if (event.press) {
-        SendModifierSet(modifiers, true);
+        SendModifierSet(effective_modifiers, true);
         SendVirtualKey(vk, true);
         SendVirtualKey(vk, false);
-        SendModifierSet(modifiers, false);
+        SendModifierSet(effective_modifiers, false);
       } else {
-        SendModifierSet(modifiers, event.down);
+        SendModifierSet(effective_modifiers, event.down);
         SendVirtualKey(vk, event.down);
       }
       return true;
@@ -14850,7 +15979,23 @@ void PortableHostApp::RendezvousWorker() {
       std::wstring last_local_clipboard_text;
       std::wstring last_remote_clipboard_text;
       GetClipboardUnicodeText(&last_local_clipboard_text, nullptr);
+      std::wstring last_local_formatted_clipboard_signature;
+      std::wstring last_remote_formatted_clipboard_signature;
+      FormattedTextClipboardContent initial_formatted_clipboard;
+      CaptureFormattedTextClipboardContent(
+          &initial_formatted_clipboard,
+          &last_local_formatted_clipboard_signature,
+          nullptr);
       auto next_clipboard_poll = std::chrono::steady_clock::now();
+      DWORD last_local_clipboard_sequence = GetClipboardSequenceNumber();
+      bool peer_cliprdr_ready = false;
+      const int local_file_descriptor_format_id =
+          static_cast<int>(GetFileDescriptorClipboardFormat());
+      const int local_file_contents_format_id =
+          static_cast<int>(GetFileContentsClipboardFormat());
+      std::wstring last_local_file_clipboard_signature;
+      std::vector<LocalClipboardFileDescriptor> local_file_clipboard_entries;
+      std::vector<unsigned char> local_file_clipboard_descriptor_payload;
       std::vector<std::weak_ptr<RemoteFileClipboardBridge>> file_clipboard_brokers;
       auto describe_file_clipboard_progress = [&]() -> std::wstring {
         return channel_name + L" serving on-demand clipboard file transfer";
@@ -15122,7 +16267,7 @@ void PortableHostApp::RendezvousWorker() {
           video_thread.Join();
         }
       };
-      auto try_forward_local_text_clipboard =
+      auto try_forward_local_clipboard =
           [&](std::wstring* clipboard_status) -> bool {
         const auto now = std::chrono::steady_clock::now();
         if (now < next_clipboard_poll) {
@@ -15130,32 +16275,114 @@ void PortableHostApp::RendezvousWorker() {
         }
         next_clipboard_poll = now + std::chrono::milliseconds(350);
 
-        std::wstring clipboard_text;
-        if (!GetClipboardUnicodeText(&clipboard_text, nullptr)) {
+        const DWORD clipboard_sequence = GetClipboardSequenceNumber();
+        if (clipboard_sequence == last_local_clipboard_sequence) {
           return true;
         }
-        if (clipboard_text == last_local_clipboard_text) {
-          return true;
-        }
-        last_local_clipboard_text = clipboard_text;
-        if (clipboard_text == last_remote_clipboard_text) {
-          last_remote_clipboard_text.clear();
-          return true;
+        last_local_clipboard_sequence = clipboard_sequence;
+
+        FormattedTextClipboardContent local_formatted_clipboard;
+        std::wstring local_formatted_clipboard_signature;
+        if (CaptureFormattedTextClipboardContent(
+                &local_formatted_clipboard,
+                &local_formatted_clipboard_signature,
+                nullptr)) {
+          if (local_formatted_clipboard_signature !=
+              last_local_formatted_clipboard_signature) {
+            if (local_formatted_clipboard_signature ==
+                last_remote_formatted_clipboard_signature) {
+              last_local_formatted_clipboard_signature =
+                  local_formatted_clipboard_signature;
+              last_remote_formatted_clipboard_signature.clear();
+            } else {
+              std::vector<ClipboardMessageData> outbound_clipboards;
+              if (BuildFormattedTextClipboardMessages(
+                      local_formatted_clipboard,
+                      &outbound_clipboards)) {
+                const bool sending_rich_text =
+                    outbound_clipboards.size() > 1U ||
+                    (outbound_clipboards.size() == 1U &&
+                     outbound_clipboards.front().format !=
+                         kClipboardFormatText);
+                const std::vector<unsigned char> clipboard_message =
+                    outbound_clipboards.size() == 1U
+                        ? EncodeSingleClipboardMessage(
+                              outbound_clipboards.front())
+                        : EncodeMultiClipboardMessage(outbound_clipboards);
+                std::wstring clipboard_error;
+                if (!connection->SendFrame(
+                        clipboard_message,
+                        &clipboard_error)) {
+                  if (clipboard_status != nullptr) {
+                    *clipboard_status =
+                        channel_name + L" local clipboard send failed: " +
+                        clipboard_error;
+                  }
+                  return false;
+                }
+                if (clipboard_status != nullptr) {
+                  *clipboard_status =
+                      sending_rich_text
+                          ? channel_name +
+                                L" forwarded local formatted clipboard to controller"
+                          : channel_name +
+                                L" forwarded local text clipboard to controller";
+                }
+              }
+              last_local_formatted_clipboard_signature =
+                  local_formatted_clipboard_signature;
+            }
+          }
+          last_local_clipboard_text =
+              local_formatted_clipboard.has_text
+                  ? local_formatted_clipboard.text
+                  : std::wstring();
+        } else {
+          last_local_formatted_clipboard_signature.clear();
+          last_local_clipboard_text.clear();
         }
 
-        std::wstring clipboard_error;
-        if (!connection->SendFrame(
-                EncodeClipboardTextMessage(clipboard_text),
-                &clipboard_error)) {
-          if (clipboard_status != nullptr) {
-            *clipboard_status =
-                channel_name + L" local clipboard send failed: " + clipboard_error;
+        if (peer_cliprdr_ready) {
+          std::vector<LocalClipboardFileDescriptor> file_entries;
+          std::vector<unsigned char> descriptor_payload;
+          std::wstring signature;
+          if (CaptureLocalClipboardFileDescriptors(
+                  &file_entries,
+                  &descriptor_payload,
+                  &signature,
+                  nullptr)) {
+            if (signature != last_local_file_clipboard_signature ||
+                descriptor_payload != local_file_clipboard_descriptor_payload) {
+              std::vector<CliprdrFormatData> formats;
+              CliprdrFormatData file_descriptor_format;
+              file_descriptor_format.id = local_file_descriptor_format_id;
+              file_descriptor_format.format_name = L"FileGroupDescriptorW";
+              formats.push_back(file_descriptor_format);
+              CliprdrFormatData file_contents_format;
+              file_contents_format.id = local_file_contents_format_id;
+              file_contents_format.format_name = L"FileContents";
+              formats.push_back(file_contents_format);
+
+              std::wstring clipboard_error;
+              if (!connection->SendFrame(
+                      EncodeCliprdrFormatListMessage(formats),
+                      &clipboard_error)) {
+                if (clipboard_status != nullptr) {
+                  *clipboard_status =
+                      channel_name + L" local file clipboard send failed: " + clipboard_error;
+                }
+                return false;
+              }
+              local_file_clipboard_entries = std::move(file_entries);
+              local_file_clipboard_descriptor_payload =
+                  std::move(descriptor_payload);
+              last_local_file_clipboard_signature = std::move(signature);
+              if (clipboard_status != nullptr) {
+                *clipboard_status =
+                    channel_name + L" forwarded local file clipboard to controller";
+              }
+            }
           }
-          return false;
-        }
-        if (clipboard_status != nullptr) {
-          *clipboard_status =
-              channel_name + L" forwarded local text clipboard to controller";
         }
         return true;
       };
@@ -15198,7 +16425,7 @@ void PortableHostApp::RendezvousWorker() {
         const TcpFramedConnection::ReceiveState post_login_state =
             connection->ReceiveFrame(&frame, kSessionPollMs, session_status);
         if (post_login_state == TcpFramedConnection::ReceiveState::kTimeout) {
-          if (!try_forward_local_text_clipboard(session_status)) {
+          if (!try_forward_local_clipboard(session_status)) {
             close_file_clipboard_brokers(channel_name + L" local clipboard send failed");
             stop_video_session();
             return false;
@@ -15298,33 +16525,52 @@ void PortableHostApp::RendezvousWorker() {
         }
         if (!session_message.clipboards.empty()) {
           handled_follow_up = true;
-          bool updated_text_clipboard = false;
-          for (const ClipboardMessageData& clipboard : session_message.clipboards) {
-            std::wstring clipboard_text;
-            std::wstring clipboard_error;
-            if (!ExtractClipboardWideText(clipboard, &clipboard_text, &clipboard_error)) {
-              if (clipboard.format == kClipboardFormatText && session_status != nullptr &&
-                  !clipboard_error.empty()) {
-                *session_status = channel_name + L" clipboard text update failed: " + clipboard_error;
+          FormattedTextClipboardContent remote_formatted_clipboard;
+          std::wstring remote_formatted_clipboard_signature;
+          std::wstring clipboard_error;
+          if (DecodeFormattedTextClipboardContent(
+                  session_message.clipboards,
+                  &remote_formatted_clipboard,
+                  &remote_formatted_clipboard_signature,
+                  &clipboard_error)) {
+            if (SetClipboardFormattedTextContent(
+                    remote_formatted_clipboard,
+                    &clipboard_error)) {
+              last_remote_clipboard_text =
+                  remote_formatted_clipboard.has_text
+                      ? remote_formatted_clipboard.text
+                      : std::wstring();
+              last_local_clipboard_text = last_remote_clipboard_text;
+              last_remote_formatted_clipboard_signature =
+                  remote_formatted_clipboard_signature;
+              last_local_formatted_clipboard_signature =
+                  remote_formatted_clipboard_signature;
+              if (session_status != nullptr) {
+                *session_status =
+                    (remote_formatted_clipboard.has_html ||
+                     remote_formatted_clipboard.has_rtf)
+                        ? channel_name +
+                              L" updated remote formatted clipboard"
+                        : channel_name + L" updated remote text clipboard";
               }
-              continue;
-            }
-            if (SetClipboardUnicodeText(clipboard_text, &clipboard_error)) {
-              last_remote_clipboard_text = clipboard_text;
-              last_local_clipboard_text = clipboard_text;
-              updated_text_clipboard = true;
             } else if (session_status != nullptr) {
-              *session_status = channel_name + L" clipboard text update failed: " + clipboard_error;
+              *session_status =
+                  channel_name + L" clipboard text update failed: " +
+                  clipboard_error;
             }
-          }
-          if (updated_text_clipboard && session_status != nullptr) {
-            *session_status = channel_name + L" updated remote text clipboard";
+          } else if (session_status != nullptr && !clipboard_error.empty()) {
+            *session_status =
+                channel_name + L" clipboard text update failed: " +
+                clipboard_error;
           }
         }
         if (session_message.has_cliprdr) {
           handled_follow_up = true;
           switch (session_message.cliprdr.kind) {
             case CliprdrMessageKind::kReady:
+              peer_cliprdr_ready = true;
+              last_local_clipboard_sequence = 0;
+              next_clipboard_poll = std::chrono::steady_clock::time_point();
               if (session_status != nullptr) {
                 *session_status = channel_name + L" cliprdr monitor-ready acknowledged";
               }
@@ -15364,6 +16610,32 @@ void PortableHostApp::RendezvousWorker() {
               }
               break;
             }
+            case CliprdrMessageKind::kFormatDataRequest:
+              if (session_message.cliprdr.requested_format_id ==
+                      local_file_descriptor_format_id &&
+                  !local_file_clipboard_descriptor_payload.empty()) {
+                std::wstring clipboard_error;
+                if (!connection->SendFrame(
+                        EncodeCliprdrFormatDataResponseMessage(
+                            kCliprdrResponseOk,
+                            local_file_clipboard_descriptor_payload),
+                        &clipboard_error)) {
+                  if (session_status != nullptr) {
+                    *session_status =
+                        channel_name + L" local clipboard format-data response failed: " +
+                        clipboard_error;
+                  }
+                  close_file_clipboard_brokers(
+                      channel_name + L" local clipboard format-data response send failed");
+                  stop_video_session();
+                  return false;
+                }
+                if (session_status != nullptr) {
+                  *session_status =
+                      channel_name + L" sent local clipboard file descriptors to controller";
+                }
+              }
+              break;
             case CliprdrMessageKind::kFormatDataResponse:
               if (session_message.cliprdr.msg_flags != kCliprdrResponseOk) {
                 if (session_status != nullptr) {
@@ -15381,6 +16653,49 @@ void PortableHostApp::RendezvousWorker() {
               if (!handle_file_contents_response(session_message.cliprdr) &&
                   session_status != nullptr && session_status->empty()) {
                 *session_status = channel_name + L" clipboard file response could not be applied";
+              }
+              break;
+            case CliprdrMessageKind::kFileContentsRequest:
+              if (!local_file_clipboard_entries.empty()) {
+                active_clipboard_file_requests.fetch_add(1);
+                ScopeExit local_file_request_scope([&]() {
+                  active_clipboard_file_requests.fetch_sub(1);
+                });
+                std::vector<unsigned char> payload;
+                std::wstring build_error;
+                const bool build_ok = BuildLocalClipboardFileContentsPayload(
+                    local_file_clipboard_entries,
+                    session_message.cliprdr,
+                    &payload,
+                    &build_error);
+                std::wstring send_error;
+                if (!connection->SendFrame(
+                        EncodeCliprdrFileContentsResponseMessage(
+                            build_ok ? kCliprdrResponseOk : 0,
+                            session_message.cliprdr.stream_id,
+                            payload),
+                        &send_error)) {
+                  if (session_status != nullptr) {
+                    *session_status =
+                        channel_name + L" local clipboard file response send failed: " +
+                        send_error;
+                  }
+                  close_file_clipboard_brokers(
+                      channel_name + L" local clipboard file response send failed");
+                  stop_video_session();
+                  return false;
+                }
+                if (session_status != nullptr) {
+                  *session_status = build_ok
+                      ? (((session_message.cliprdr.dw_flags &
+                           kCliprdrFileContentsSizeFlag) != 0)
+                             ? channel_name +
+                                   L" reported local clipboard file size to controller"
+                             : channel_name +
+                                   L" streamed local clipboard file block to controller")
+                      : channel_name +
+                            L" local clipboard file request failed: " + build_error;
+                }
               }
               break;
             case CliprdrMessageKind::kTryEmpty:
@@ -16151,7 +17466,23 @@ void PortableHostApp::RendezvousWorker() {
         std::wstring last_local_clipboard_text;
         std::wstring last_remote_clipboard_text;
         GetClipboardUnicodeText(&last_local_clipboard_text, nullptr);
+        std::wstring last_local_formatted_clipboard_signature;
+        std::wstring last_remote_formatted_clipboard_signature;
+        FormattedTextClipboardContent initial_formatted_clipboard;
+        CaptureFormattedTextClipboardContent(
+            &initial_formatted_clipboard,
+            &last_local_formatted_clipboard_signature,
+            nullptr);
         auto next_clipboard_poll = std::chrono::steady_clock::now();
+        DWORD last_local_clipboard_sequence = GetClipboardSequenceNumber();
+        bool peer_cliprdr_ready = false;
+        const int local_file_descriptor_format_id =
+            static_cast<int>(GetFileDescriptorClipboardFormat());
+        const int local_file_contents_format_id =
+            static_cast<int>(GetFileContentsClipboardFormat());
+        std::wstring last_local_file_clipboard_signature;
+        std::vector<LocalClipboardFileDescriptor> local_file_clipboard_entries;
+        std::vector<unsigned char> local_file_clipboard_descriptor_payload;
         std::vector<std::weak_ptr<RemoteFileClipboardBridge>> file_clipboard_brokers;
         auto describe_file_clipboard_progress = [&]() -> std::wstring {
           return channel_name + L" serving on-demand clipboard file transfer";
@@ -16423,7 +17754,7 @@ void PortableHostApp::RendezvousWorker() {
             video_thread.Join();
           }
         };
-        auto try_forward_local_text_clipboard =
+        auto try_forward_local_clipboard =
             [&](std::wstring* clipboard_status) -> bool {
           const auto now = std::chrono::steady_clock::now();
           if (now < next_clipboard_poll) {
@@ -16431,32 +17762,115 @@ void PortableHostApp::RendezvousWorker() {
           }
           next_clipboard_poll = now + std::chrono::milliseconds(350);
 
-          std::wstring clipboard_text;
-          if (!GetClipboardUnicodeText(&clipboard_text, nullptr)) {
+          const DWORD clipboard_sequence = GetClipboardSequenceNumber();
+          if (clipboard_sequence == last_local_clipboard_sequence) {
             return true;
           }
-          if (clipboard_text == last_local_clipboard_text) {
-            return true;
-          }
-          last_local_clipboard_text = clipboard_text;
-          if (clipboard_text == last_remote_clipboard_text) {
-            last_remote_clipboard_text.clear();
-            return true;
+          last_local_clipboard_sequence = clipboard_sequence;
+
+          FormattedTextClipboardContent local_formatted_clipboard;
+          std::wstring local_formatted_clipboard_signature;
+          if (CaptureFormattedTextClipboardContent(
+                  &local_formatted_clipboard,
+                  &local_formatted_clipboard_signature,
+                  nullptr)) {
+            if (local_formatted_clipboard_signature !=
+                last_local_formatted_clipboard_signature) {
+              if (local_formatted_clipboard_signature ==
+                  last_remote_formatted_clipboard_signature) {
+                last_local_formatted_clipboard_signature =
+                    local_formatted_clipboard_signature;
+                last_remote_formatted_clipboard_signature.clear();
+              } else {
+                std::vector<ClipboardMessageData> outbound_clipboards;
+                if (BuildFormattedTextClipboardMessages(
+                        local_formatted_clipboard,
+                        &outbound_clipboards)) {
+                  const bool sending_rich_text =
+                      outbound_clipboards.size() > 1U ||
+                      (outbound_clipboards.size() == 1U &&
+                       outbound_clipboards.front().format !=
+                           kClipboardFormatText);
+                  const std::vector<unsigned char> clipboard_message =
+                      outbound_clipboards.size() == 1U
+                          ? EncodeSingleClipboardMessage(
+                                outbound_clipboards.front())
+                          : EncodeMultiClipboardMessage(outbound_clipboards);
+                  std::wstring clipboard_error;
+                  if (!connection->SendFrame(
+                          clipboard_message,
+                          &clipboard_error)) {
+                    if (clipboard_status != nullptr) {
+                      *clipboard_status =
+                          channel_name + L" local clipboard send failed: " +
+                          clipboard_error;
+                    }
+                    return false;
+                  }
+                  if (clipboard_status != nullptr) {
+                    *clipboard_status =
+                        sending_rich_text
+                            ? channel_name +
+                                  L" forwarded local formatted clipboard to controller"
+                            : channel_name +
+                                  L" forwarded local text clipboard to controller";
+                  }
+                }
+                last_local_formatted_clipboard_signature =
+                    local_formatted_clipboard_signature;
+              }
+            }
+            last_local_clipboard_text =
+                local_formatted_clipboard.has_text
+                    ? local_formatted_clipboard.text
+                    : std::wstring();
+          } else {
+            last_local_formatted_clipboard_signature.clear();
+            last_local_clipboard_text.clear();
           }
 
-          std::wstring clipboard_error;
-          if (!connection->SendFrame(
-                  EncodeClipboardTextMessage(clipboard_text),
-                  &clipboard_error)) {
-            if (clipboard_status != nullptr) {
-              *clipboard_status =
-                  channel_name + L" local clipboard send failed: " + clipboard_error;
+          if (peer_cliprdr_ready) {
+            std::vector<LocalClipboardFileDescriptor> file_entries;
+            std::vector<unsigned char> descriptor_payload;
+            std::wstring signature;
+            if (CaptureLocalClipboardFileDescriptors(
+                    &file_entries,
+                    &descriptor_payload,
+                    &signature,
+                    nullptr)) {
+              if (signature != last_local_file_clipboard_signature ||
+                  descriptor_payload != local_file_clipboard_descriptor_payload) {
+                std::vector<CliprdrFormatData> formats;
+                CliprdrFormatData file_descriptor_format;
+                file_descriptor_format.id = local_file_descriptor_format_id;
+                file_descriptor_format.format_name = L"FileGroupDescriptorW";
+                formats.push_back(file_descriptor_format);
+                CliprdrFormatData file_contents_format;
+                file_contents_format.id = local_file_contents_format_id;
+                file_contents_format.format_name = L"FileContents";
+                formats.push_back(file_contents_format);
+
+                std::wstring clipboard_error;
+                if (!connection->SendFrame(
+                        EncodeCliprdrFormatListMessage(formats),
+                        &clipboard_error)) {
+                  if (clipboard_status != nullptr) {
+                    *clipboard_status =
+                        channel_name + L" local file clipboard send failed: " +
+                        clipboard_error;
+                  }
+                  return false;
+                }
+                local_file_clipboard_entries = std::move(file_entries);
+                local_file_clipboard_descriptor_payload =
+                    std::move(descriptor_payload);
+                last_local_file_clipboard_signature = std::move(signature);
+                if (clipboard_status != nullptr) {
+                  *clipboard_status =
+                      channel_name + L" forwarded local file clipboard to controller";
+                }
+              }
             }
-            return false;
-          }
-          if (clipboard_status != nullptr) {
-            *clipboard_status =
-                channel_name + L" forwarded local text clipboard to controller";
           }
           return true;
         };
@@ -16495,7 +17909,7 @@ void PortableHostApp::RendezvousWorker() {
           const TcpFramedConnection::ReceiveState post_login_state =
               connection->ReceiveFrame(&frame, kSessionPollMs, session_status);
           if (post_login_state == TcpFramedConnection::ReceiveState::kTimeout) {
-            if (!try_forward_local_text_clipboard(session_status)) {
+            if (!try_forward_local_clipboard(session_status)) {
               close_file_clipboard_brokers(channel_name + L" local clipboard send failed");
               stop_video_session();
               return false;
@@ -16595,33 +18009,52 @@ void PortableHostApp::RendezvousWorker() {
           }
           if (!session_message.clipboards.empty()) {
             handled_follow_up = true;
-            bool updated_text_clipboard = false;
-            for (const ClipboardMessageData& clipboard : session_message.clipboards) {
-              std::wstring clipboard_text;
-              std::wstring clipboard_error;
-              if (!ExtractClipboardWideText(clipboard, &clipboard_text, &clipboard_error)) {
-                if (clipboard.format == kClipboardFormatText && session_status != nullptr &&
-                    !clipboard_error.empty()) {
-                  *session_status = channel_name + L" clipboard text update failed: " + clipboard_error;
+            FormattedTextClipboardContent remote_formatted_clipboard;
+            std::wstring remote_formatted_clipboard_signature;
+            std::wstring clipboard_error;
+            if (DecodeFormattedTextClipboardContent(
+                    session_message.clipboards,
+                    &remote_formatted_clipboard,
+                    &remote_formatted_clipboard_signature,
+                    &clipboard_error)) {
+              if (SetClipboardFormattedTextContent(
+                      remote_formatted_clipboard,
+                      &clipboard_error)) {
+                last_remote_clipboard_text =
+                    remote_formatted_clipboard.has_text
+                        ? remote_formatted_clipboard.text
+                        : std::wstring();
+                last_local_clipboard_text = last_remote_clipboard_text;
+                last_remote_formatted_clipboard_signature =
+                    remote_formatted_clipboard_signature;
+                last_local_formatted_clipboard_signature =
+                    remote_formatted_clipboard_signature;
+                if (session_status != nullptr) {
+                  *session_status =
+                      (remote_formatted_clipboard.has_html ||
+                       remote_formatted_clipboard.has_rtf)
+                          ? channel_name +
+                                L" updated remote formatted clipboard"
+                          : channel_name + L" updated remote text clipboard";
                 }
-                continue;
-              }
-              if (SetClipboardUnicodeText(clipboard_text, &clipboard_error)) {
-                last_remote_clipboard_text = clipboard_text;
-                last_local_clipboard_text = clipboard_text;
-                updated_text_clipboard = true;
               } else if (session_status != nullptr) {
-                *session_status = channel_name + L" clipboard text update failed: " + clipboard_error;
+                *session_status =
+                    channel_name + L" clipboard text update failed: " +
+                    clipboard_error;
               }
-            }
-            if (updated_text_clipboard && session_status != nullptr) {
-              *session_status = channel_name + L" updated remote text clipboard";
+            } else if (session_status != nullptr && !clipboard_error.empty()) {
+              *session_status =
+                  channel_name + L" clipboard text update failed: " +
+                  clipboard_error;
             }
           }
           if (session_message.has_cliprdr) {
             handled_follow_up = true;
             switch (session_message.cliprdr.kind) {
               case CliprdrMessageKind::kReady:
+                peer_cliprdr_ready = true;
+                last_local_clipboard_sequence = 0;
+                next_clipboard_poll = std::chrono::steady_clock::time_point();
                 if (session_status != nullptr) {
                   *session_status = channel_name + L" cliprdr monitor-ready acknowledged";
                 }
@@ -16661,6 +18094,35 @@ void PortableHostApp::RendezvousWorker() {
                 }
                 break;
               }
+              case CliprdrMessageKind::kFormatDataRequest:
+                if (session_message.cliprdr.requested_format_id ==
+                        local_file_descriptor_format_id &&
+                    !local_file_clipboard_descriptor_payload.empty()) {
+                  std::wstring clipboard_error;
+                  if (!connection->SendFrame(
+                          EncodeCliprdrFormatDataResponseMessage(
+                              kCliprdrResponseOk,
+                              local_file_clipboard_descriptor_payload),
+                          &clipboard_error)) {
+                    if (session_status != nullptr) {
+                      *session_status =
+                          channel_name +
+                          L" local clipboard format-data response failed: " +
+                          clipboard_error;
+                    }
+                    close_file_clipboard_brokers(
+                        channel_name +
+                        L" local clipboard format-data response send failed");
+                    stop_video_session();
+                    return false;
+                  }
+                  if (session_status != nullptr) {
+                    *session_status =
+                        channel_name +
+                        L" sent local clipboard file descriptors to controller";
+                  }
+                }
+                break;
               case CliprdrMessageKind::kFormatDataResponse:
                 if (session_message.cliprdr.msg_flags != kCliprdrResponseOk) {
                   if (session_status != nullptr) {
@@ -16678,6 +18140,52 @@ void PortableHostApp::RendezvousWorker() {
                 if (!handle_file_contents_response(session_message.cliprdr) &&
                     session_status != nullptr && session_status->empty()) {
                   *session_status = channel_name + L" clipboard file response could not be applied";
+                }
+                break;
+              case CliprdrMessageKind::kFileContentsRequest:
+                if (!local_file_clipboard_entries.empty()) {
+                  active_clipboard_file_requests.fetch_add(1);
+                  ScopeExit local_file_request_scope([&]() {
+                    active_clipboard_file_requests.fetch_sub(1);
+                  });
+                  std::vector<unsigned char> payload;
+                  std::wstring build_error;
+                  const bool build_ok = BuildLocalClipboardFileContentsPayload(
+                      local_file_clipboard_entries,
+                      session_message.cliprdr,
+                      &payload,
+                      &build_error);
+                  std::wstring send_error;
+                  if (!connection->SendFrame(
+                          EncodeCliprdrFileContentsResponseMessage(
+                              build_ok ? kCliprdrResponseOk : 0,
+                              session_message.cliprdr.stream_id,
+                              payload),
+                          &send_error)) {
+                    if (session_status != nullptr) {
+                      *session_status =
+                          channel_name +
+                          L" local clipboard file response send failed: " +
+                          send_error;
+                    }
+                    close_file_clipboard_brokers(
+                        channel_name +
+                        L" local clipboard file response send failed");
+                    stop_video_session();
+                    return false;
+                  }
+                  if (session_status != nullptr) {
+                    *session_status = build_ok
+                        ? (((session_message.cliprdr.dw_flags &
+                             kCliprdrFileContentsSizeFlag) != 0)
+                               ? channel_name +
+                                     L" reported local clipboard file size to controller"
+                               : channel_name +
+                                     L" streamed local clipboard file block to controller")
+                        : channel_name +
+                              L" local clipboard file request failed: " +
+                              build_error;
+                  }
                 }
                 break;
               case CliprdrMessageKind::kTryEmpty:
