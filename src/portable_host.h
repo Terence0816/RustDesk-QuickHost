@@ -19,6 +19,10 @@ inline const wchar_t* PortableHostWindowClassName() noexcept {
   return L"RustDeskCppPortableHostWindow";
 }
 
+inline const wchar_t* PortableHostStartupTrayArgument() noexcept {
+  return L"--startup-tray";
+}
+
 class Win32Mutex {
  public:
   Win32Mutex() noexcept {
@@ -167,7 +171,7 @@ class PortableHostApp {
   PortableHostApp();
   ~PortableHostApp();
 
-  bool Initialize(HINSTANCE instance);
+  bool Initialize(HINSTANCE instance, bool start_hidden_on_launch = false);
   int Run();
 
  private:
@@ -359,6 +363,7 @@ class PortableHostApp {
   ServerState server_state_ = ServerState::kUnknown;
   bool winsock_ready_ = false;
   bool ole_ready_ = false;
+  bool start_hidden_on_launch_ = false;
   std::wstring rendezvous_status_text_;
   bool rendezvous_registered_ = false;
   std::wstring public_key_hex_;
@@ -376,6 +381,7 @@ class PortableHostApp {
   std::atomic<bool> active_session_running_{false};
   std::atomic<bool> auxiliary_session_running_{false};
   std::atomic<bool> active_session_connected_{false};
+  std::atomic<long> desktop_session_count_{0};
   std::atomic<unsigned long> active_session_generation_{0};
   void* active_session_connection_ = nullptr;
   void* auxiliary_session_connection_ = nullptr;

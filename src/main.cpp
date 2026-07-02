@@ -1,5 +1,8 @@
 #include "portable_host.h"
 
+#include <shellapi.h>
+#include <wchar.h>
+
 namespace {
 
 constexpr wchar_t kSingleInstanceMutexName[] = L"Local\\RustDeskQSCppSingleInstance";
@@ -31,14 +34,46 @@ void ActivateRunningInstanceWindow(HWND window) {
   SetForegroundWindow(window);
 }
 
+bool CommandLineHasSwitch(const wchar_t* expected_switch) {
+  if (expected_switch == nullptr || *expected_switch == L'\0') {
+    return false;
+  }
+
+  int argument_count = 0;
+  LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
+  if (arguments == nullptr) {
+    return false;
+  }
+
+  bool found = false;
+  for (int index = 1; index < argument_count; ++index) {
+    if (_wcsicmp(arguments[index], expected_switch) == 0) {
+      found = true;
+      break;
+    }
+  }
+
+  LocalFree(arguments);
+  return found;
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+  const bool startup_tray_launch =
+      CommandLineHasSwitch(PortableHostStartupTrayArgument());
   HANDLE single_instance_mutex = CreateMutexW(nullptr, FALSE, kSingleInstanceMutexName);
   const DWORD mutex_error = GetLastError();
   const bool another_instance_exists = mutex_error == ERROR_ALREADY_EXISTS;
 
   if (another_instance_exists) {
+    if (startup_tray_launch) {
+      if (single_instance_mutex != nullptr) {
+        CloseHandle(single_instance_mutex);
+      }
+      return 0;
+    }
+
     const HWND running_window = WaitForRunningInstanceWindow(10000);
     if (running_window != nullptr) {
       ActivateRunningInstanceWindow(running_window);
@@ -60,7 +95,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   }
 
   PortableHostApp app;
-  if (!app.Initialize(instance)) {
+  if (!app.Initialize(instance, startup_tray_launch)) {
     MessageBoxW(
         nullptr,
         L"Failed to start the portable C++ host shell.",

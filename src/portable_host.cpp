@@ -629,7 +629,7 @@ constexpr int kCliprdrFileContentsRangeFlag = 0x00000002;
 constexpr size_t kClipboardFileTransferChunkSize = 64 * 1024;
 constexpr size_t kFileTransferBlockSize = 128 * 1024;
 constexpr wchar_t kProjectUrl[] = L"https://github.com/Terence0816/RustDesk-QuickHost";
-constexpr wchar_t kAboutDisplayVersion[] = L"1.1.2.1";
+constexpr wchar_t kAboutDisplayVersion[] = L"1.1.2.2";
 constexpr wchar_t kCppHostVersion[] = L"1.1.10-cpp";
 constexpr wchar_t kAppWindowTitle[] = L"RustDeskQS Host";
 constexpr wchar_t kAppWindowClassName[] = L"RustDeskCppPortableHostWindow";
@@ -6091,6 +6091,80 @@ bool SetClipboardUnicodeText(const std::wstring& text, std::wstring* error_text)
   return true;
 }
 
+bool GetClipboardUnicodeText(std::wstring* text, std::wstring* error_text) {
+  if (text == nullptr) {
+    if (error_text != nullptr) {
+      *error_text = L"clipboard text target was null";
+    }
+    return false;
+  }
+  text->clear();
+
+  if (!OpenClipboard(nullptr)) {
+    if (error_text != nullptr) {
+      *error_text = L"OpenClipboard failed";
+    }
+    return false;
+  }
+
+  const auto close_clipboard = []() {
+    CloseClipboard();
+  };
+
+  HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+  if (handle != nullptr) {
+    const wchar_t* locked = static_cast<const wchar_t*>(GlobalLock(handle));
+    if (locked == nullptr) {
+      close_clipboard();
+      if (error_text != nullptr) {
+        *error_text = L"GlobalLock failed for clipboard text";
+      }
+      return false;
+    }
+    *text = locked;
+    GlobalUnlock(handle);
+    close_clipboard();
+    return true;
+  }
+
+  handle = GetClipboardData(CF_TEXT);
+  if (handle != nullptr) {
+    const char* locked = static_cast<const char*>(GlobalLock(handle));
+    if (locked == nullptr) {
+      close_clipboard();
+      if (error_text != nullptr) {
+        *error_text = L"GlobalLock failed for ANSI clipboard text";
+      }
+      return false;
+    }
+    *text = AnsiToWideCompat(locked);
+    GlobalUnlock(handle);
+    close_clipboard();
+    return true;
+  }
+
+  close_clipboard();
+  if (error_text != nullptr) {
+    *error_text = L"clipboard does not contain text";
+  }
+  return false;
+}
+
+std::vector<unsigned char> EncodeClipboardTextMessage(const std::wstring& text) {
+  const std::string utf8_text = WideToUtf8(text);
+  std::vector<unsigned char> clipboard;
+  AppendVarintField(1U, 0U, &clipboard);
+  AppendBytesField(
+      2U,
+      std::vector<unsigned char>(utf8_text.begin(), utf8_text.end()),
+      &clipboard);
+  AppendVarintField(5U, static_cast<uint64_t>(kClipboardFormatText), &clipboard);
+
+  std::vector<unsigned char> message;
+  AppendLengthDelimitedField(16U, clipboard, &message);
+  return message;
+}
+
 std::wstring BuildClipboardStagingRoot(const HostConfig& config) {
   return config.exe_dir + L"\\clipboard_staging";
 }
@@ -10081,6 +10155,21 @@ std::wstring RegisterPkResultText(int result) {
   }
 }
 
+std::wstring BuildLaunchOnStartupCommand(
+    const std::wstring& executable_path,
+    bool start_hidden_to_tray) {
+  if (executable_path.empty()) {
+    return std::wstring();
+  }
+
+  std::wstring command = L"\"" + executable_path + L"\"";
+  if (start_hidden_to_tray) {
+    command += L" ";
+    command += PortableHostStartupTrayArgument();
+  }
+  return command;
+}
+
 }  // namespace
 
 PortableHostApp::PortableHostApp() {
@@ -10136,8 +10225,9 @@ PortableHostApp::~PortableHostApp() {
   }
 }
 
-bool PortableHostApp::Initialize(HINSTANCE instance) {
+bool PortableHostApp::Initialize(HINSTANCE instance, bool start_hidden_on_launch) {
   instance_ = instance;
+  start_hidden_on_launch_ = start_hidden_on_launch;
   EnableBestEffortDpiAwareness();
   taskbar_created_message_ = RegisterWindowMessageW(L"TaskbarCreated");
 
@@ -10161,6 +10251,9 @@ bool PortableHostApp::Initialize(HINSTANCE instance) {
   button_brush_ = CreateSolidBrush(kAccentColor);
 
   LoadOrCreateConfig();
+  if (IsLaunchOnStartupEnabled()) {
+    SetLaunchOnStartupEnabled(true);
+  }
   AppendPortableHostLog(
       L"app",
       L"Initialize config: exe_dir=" + config_.exe_dir +
@@ -10182,8 +10275,12 @@ bool PortableHostApp::Initialize(HINSTANCE instance) {
 }
 
 int PortableHostApp::Run() {
-  ShowWindow(window_, SW_SHOWDEFAULT);
-  UpdateWindow(window_);
+  if (start_hidden_on_launch_) {
+    HideMainWindowToTray();
+  } else {
+    ShowWindow(window_, SW_SHOWDEFAULT);
+    UpdateWindow(window_);
+  }
 
   MSG message = {};
   while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -10583,7 +10680,9 @@ bool PortableHostApp::AddTrayIcon() {
   lstrcpynW(notify_data.szTip, app_title.c_str(), ARRAYSIZE(notify_data.szTip));
 
   if (tray_icon_added_) {
-    Shell_NotifyIconW(NIM_DELETE, &notify_data);
+    if (Shell_NotifyIconW(NIM_MODIFY, &notify_data)) {
+      return true;
+    }
     tray_icon_added_ = false;
   }
 
@@ -12871,6 +12970,7 @@ void PortableHostApp::StartRendezvousWorker() {
   active_session_running_.store(false);
   auxiliary_session_running_.store(false);
   active_session_connected_.store(false);
+  desktop_session_count_.store(0);
   active_session_generation_.store(0);
   {
     Win32LockGuard guard(active_session_mutex_);
@@ -13032,9 +13132,13 @@ void PortableHostApp::ActiveSessionWorker() {
             L", status=" + session_status);
 
     active_session_running_.store(false);
-    active_session_connected_.store(false);
+    if (desktop_session_count_.load() <= 0) {
+      active_session_connected_.store(false);
+    }
     ClearActiveSessionConnection(nullptr);
-    ClearActiveSessionIdentity();
+    if (desktop_session_count_.load() <= 0) {
+      ClearActiveSessionIdentity();
+    }
 
     bool has_pending_session = false;
     {
@@ -13388,9 +13492,19 @@ bool PortableHostApp::IsLaunchOnStartupEnabled() const {
     return false;
   }
 
-  std::wstring expected = L"\"" + GetExecutablePath() + L"\"";
-  std::wstring stored = buffer;
-  return !_wcsicmp(stored.c_str(), expected.c_str());
+  const std::wstring executable_path = GetExecutablePath();
+  const std::wstring stored = buffer;
+  const std::wstring hidden_command =
+      BuildLaunchOnStartupCommand(executable_path, true);
+  if (!hidden_command.empty() &&
+      _wcsicmp(stored.c_str(), hidden_command.c_str()) == 0) {
+    return true;
+  }
+
+  const std::wstring legacy_command =
+      BuildLaunchOnStartupCommand(executable_path, false);
+  return !legacy_command.empty() &&
+         _wcsicmp(stored.c_str(), legacy_command.c_str()) == 0;
 }
 
 bool PortableHostApp::SetLaunchOnStartupEnabled(bool enabled) {
@@ -13411,7 +13525,8 @@ bool PortableHostApp::SetLaunchOnStartupEnabled(bool enabled) {
 
   bool ok = true;
   if (enabled) {
-    const std::wstring command = L"\"" + GetExecutablePath() + L"\"";
+    const std::wstring command =
+        BuildLaunchOnStartupCommand(GetExecutablePath(), true);
     const DWORD bytes =
         static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t));
     ok = RegSetValueExW(
@@ -14712,12 +14827,30 @@ void PortableHostApp::RendezvousWorker() {
             const std::wstring& channel_name,
             const std::wstring& connected_remote_id,
             const std::wstring& connected_remote_name,
+            bool use_auxiliary_stop_path,
             std::wstring* session_status) -> bool {
+      auto is_desktop_session_stop_requested = [this, use_auxiliary_stop_path]() -> bool {
+        return use_auxiliary_stop_path
+            ? IsAuxiliarySessionStopRequested()
+            : IsActiveSessionStopRequested();
+      };
+      desktop_session_count_.fetch_add(1);
       active_session_connected_.store(true);
       StoreActiveSessionIdentity(connected_remote_id, connected_remote_name);
+      ScopeExit desktop_session_scope([this]() {
+        const long remaining = desktop_session_count_.fetch_sub(1) - 1;
+        if (remaining <= 0) {
+          active_session_connected_.store(false);
+          ClearActiveSessionIdentity();
+        }
+      });
 
       std::atomic<int> active_clipboard_file_requests{0};
       std::atomic<int> next_clipboard_stream_id{1};
+      std::wstring last_local_clipboard_text;
+      std::wstring last_remote_clipboard_text;
+      GetClipboardUnicodeText(&last_local_clipboard_text, nullptr);
+      auto next_clipboard_poll = std::chrono::steady_clock::now();
       std::vector<std::weak_ptr<RemoteFileClipboardBridge>> file_clipboard_brokers;
       auto describe_file_clipboard_progress = [&]() -> std::wstring {
         return channel_name + L" serving on-demand clipboard file transfer";
@@ -14823,7 +14956,7 @@ void PortableHostApp::RendezvousWorker() {
         auto next_video_deadline = video_epoch;
         bool use_vp8_runtime = start_with_vp8;
 
-        while (!stop_video_thread.load() && !IsActiveSessionStopRequested()) {
+        while (!stop_video_thread.load() && !is_desktop_session_stop_requested()) {
           if (active_clipboard_file_requests.load() > 0) {
             Sleep(20);
             continue;
@@ -14989,12 +15122,50 @@ void PortableHostApp::RendezvousWorker() {
           video_thread.Join();
         }
       };
+      auto try_forward_local_text_clipboard =
+          [&](std::wstring* clipboard_status) -> bool {
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_clipboard_poll) {
+          return true;
+        }
+        next_clipboard_poll = now + std::chrono::milliseconds(350);
+
+        std::wstring clipboard_text;
+        if (!GetClipboardUnicodeText(&clipboard_text, nullptr)) {
+          return true;
+        }
+        if (clipboard_text == last_local_clipboard_text) {
+          return true;
+        }
+        last_local_clipboard_text = clipboard_text;
+        if (clipboard_text == last_remote_clipboard_text) {
+          last_remote_clipboard_text.clear();
+          return true;
+        }
+
+        std::wstring clipboard_error;
+        if (!connection->SendFrame(
+                EncodeClipboardTextMessage(clipboard_text),
+                &clipboard_error)) {
+          if (clipboard_status != nullptr) {
+            *clipboard_status =
+                channel_name + L" local clipboard send failed: " + clipboard_error;
+          }
+          return false;
+        }
+        if (clipboard_status != nullptr) {
+          *clipboard_status =
+              channel_name + L" forwarded local text clipboard to controller";
+        }
+        return true;
+      };
 
       bool echoed_test_delay = false;
       std::vector<unsigned char> frame;
       while (true) {
-        if (IsActiveSessionStopRequested()) {
+        if (is_desktop_session_stop_requested()) {
           const bool manual_close_requested =
+              !use_auxiliary_stop_path &&
               active_session_manual_close_requested_.exchange(false);
           if (manual_close_requested) {
             connection->SendFrame(
@@ -15006,7 +15177,9 @@ void PortableHostApp::RendezvousWorker() {
           if (session_status != nullptr) {
             *session_status = manual_close_requested
                 ? channel_name + L" closed locally"
-                : channel_name + L" stopping active session";
+                : (use_auxiliary_stop_path
+                       ? channel_name + L" stopping auxiliary desktop session"
+                       : channel_name + L" stopping active session");
           }
           return true;
         }
@@ -15025,6 +15198,11 @@ void PortableHostApp::RendezvousWorker() {
         const TcpFramedConnection::ReceiveState post_login_state =
             connection->ReceiveFrame(&frame, kSessionPollMs, session_status);
         if (post_login_state == TcpFramedConnection::ReceiveState::kTimeout) {
+          if (!try_forward_local_text_clipboard(session_status)) {
+            close_file_clipboard_brokers(channel_name + L" local clipboard send failed");
+            stop_video_session();
+            return false;
+          }
           if (session_status != nullptr) {
             if (active_clipboard_file_requests.load() > 0) {
               *session_status = describe_file_clipboard_progress();
@@ -15132,6 +15310,8 @@ void PortableHostApp::RendezvousWorker() {
               continue;
             }
             if (SetClipboardUnicodeText(clipboard_text, &clipboard_error)) {
+              last_remote_clipboard_text = clipboard_text;
+              last_local_clipboard_text = clipboard_text;
               updated_text_clipboard = true;
             } else if (session_status != nullptr) {
               *session_status = channel_name + L" clipboard text update failed: " + clipboard_error;
@@ -15249,18 +15429,32 @@ void PortableHostApp::RendezvousWorker() {
          &should_auto_accept_secondary_file_transfer,
          &run_file_transfer_session_loop,
          &run_desktop_session_loop](
-            TcpFramedConnection* connection,
-            const std::wstring& channel_name,
-            const std::wstring& display_remote_id_override,
-            std::wstring* session_status) -> bool {
-      RegisterActiveSessionConnection(connection);
+             TcpFramedConnection* connection,
+             const std::wstring& channel_name,
+             const std::wstring& display_remote_id_override,
+             bool use_auxiliary_stop_path,
+             std::wstring* session_status) -> bool {
+      if (use_auxiliary_stop_path) {
+        RegisterAuxiliarySessionConnection(connection);
+      } else {
+        RegisterActiveSessionConnection(connection);
+      }
       std::shared_ptr<void> connection_scope(
           connection,
-          [this](void* registered_connection) {
-            ClearActiveSessionConnection(registered_connection);
+          [this, use_auxiliary_stop_path](void* registered_connection) {
+            if (use_auxiliary_stop_path) {
+              ClearAuxiliarySessionConnection(registered_connection);
+            } else {
+              ClearActiveSessionConnection(registered_connection);
+            }
           });
       const std::wstring display_remote_id =
           Trim(display_remote_id_override);
+      const auto is_direct_session_stop_requested =
+          [this, use_auxiliary_stop_path]() -> bool {
+        return use_auxiliary_stop_path ? IsAuxiliarySessionStopRequested()
+                                       : IsActiveSessionStopRequested();
+      };
 
       const std::string hash_salt = session_device_uuid_snapshot.empty()
                                         ? WideToUtf8(session_config.host_id)
@@ -15302,8 +15496,9 @@ void PortableHostApp::RendezvousWorker() {
       });
 
       while (true) {
-        if (IsActiveSessionStopRequested()) {
+        if (is_direct_session_stop_requested()) {
           const bool manual_close_requested =
+              !use_auxiliary_stop_path &&
               active_session_manual_close_requested_.exchange(false);
           if (manual_close_requested) {
             connection->SendFrame(
@@ -15313,7 +15508,9 @@ void PortableHostApp::RendezvousWorker() {
           if (session_status != nullptr) {
             *session_status = manual_close_requested
                 ? channel_name + L" closed locally before login"
-                : channel_name + L" session stop requested";
+                : (use_auxiliary_stop_path
+                       ? channel_name + L" auxiliary session stop requested"
+                       : channel_name + L" session stop requested");
           }
           connection->Abort();
           return true;
@@ -15557,6 +15754,7 @@ void PortableHostApp::RendezvousWorker() {
             channel_name,
             connected_remote_id,
             connected_remote_name,
+            use_auxiliary_stop_path,
             session_status);
       }
     };
@@ -15937,11 +16135,23 @@ void PortableHostApp::RendezvousWorker() {
           return false;
         }
 
+        desktop_session_count_.fetch_add(1);
         active_session_connected_.store(true);
         StoreActiveSessionIdentity(connected_remote_id, connected_remote_name);
+        ScopeExit desktop_session_scope([this]() {
+          const long remaining = desktop_session_count_.fetch_sub(1) - 1;
+          if (remaining <= 0) {
+            active_session_connected_.store(false);
+            ClearActiveSessionIdentity();
+          }
+        });
 
         std::atomic<int> active_clipboard_file_requests{0};
         std::atomic<int> next_clipboard_stream_id{1};
+        std::wstring last_local_clipboard_text;
+        std::wstring last_remote_clipboard_text;
+        GetClipboardUnicodeText(&last_local_clipboard_text, nullptr);
+        auto next_clipboard_poll = std::chrono::steady_clock::now();
         std::vector<std::weak_ptr<RemoteFileClipboardBridge>> file_clipboard_brokers;
         auto describe_file_clipboard_progress = [&]() -> std::wstring {
           return channel_name + L" serving on-demand clipboard file transfer";
@@ -16213,6 +16423,43 @@ void PortableHostApp::RendezvousWorker() {
             video_thread.Join();
           }
         };
+        auto try_forward_local_text_clipboard =
+            [&](std::wstring* clipboard_status) -> bool {
+          const auto now = std::chrono::steady_clock::now();
+          if (now < next_clipboard_poll) {
+            return true;
+          }
+          next_clipboard_poll = now + std::chrono::milliseconds(350);
+
+          std::wstring clipboard_text;
+          if (!GetClipboardUnicodeText(&clipboard_text, nullptr)) {
+            return true;
+          }
+          if (clipboard_text == last_local_clipboard_text) {
+            return true;
+          }
+          last_local_clipboard_text = clipboard_text;
+          if (clipboard_text == last_remote_clipboard_text) {
+            last_remote_clipboard_text.clear();
+            return true;
+          }
+
+          std::wstring clipboard_error;
+          if (!connection->SendFrame(
+                  EncodeClipboardTextMessage(clipboard_text),
+                  &clipboard_error)) {
+            if (clipboard_status != nullptr) {
+              *clipboard_status =
+                  channel_name + L" local clipboard send failed: " + clipboard_error;
+            }
+            return false;
+          }
+          if (clipboard_status != nullptr) {
+            *clipboard_status =
+                channel_name + L" forwarded local text clipboard to controller";
+          }
+          return true;
+        };
 
         bool echoed_test_delay = false;
         while (true) {
@@ -16248,6 +16495,11 @@ void PortableHostApp::RendezvousWorker() {
           const TcpFramedConnection::ReceiveState post_login_state =
               connection->ReceiveFrame(&frame, kSessionPollMs, session_status);
           if (post_login_state == TcpFramedConnection::ReceiveState::kTimeout) {
+            if (!try_forward_local_text_clipboard(session_status)) {
+              close_file_clipboard_brokers(channel_name + L" local clipboard send failed");
+              stop_video_session();
+              return false;
+            }
             if (session_status != nullptr) {
               if (active_clipboard_file_requests.load() > 0) {
                 *session_status = describe_file_clipboard_progress();
@@ -16355,6 +16607,8 @@ void PortableHostApp::RendezvousWorker() {
                 continue;
               }
               if (SetClipboardUnicodeText(clipboard_text, &clipboard_error)) {
+                last_remote_clipboard_text = clipboard_text;
+                last_local_clipboard_text = clipboard_text;
                 updated_text_clipboard = true;
               } else if (session_status != nullptr) {
                 *session_status = channel_name + L" clipboard text update failed: " + clipboard_error;
@@ -16472,7 +16726,8 @@ void PortableHostApp::RendezvousWorker() {
          generate_numeric_password,
          describe_receive_state,
          &should_auto_accept_secondary_file_transfer,
-         &run_file_transfer_session_loop](
+         &run_file_transfer_session_loop,
+         &run_desktop_session_loop](
             TcpFramedConnection* connection,
             const std::wstring& channel_name,
             const std::wstring& display_remote_id_override,
@@ -16575,6 +16830,15 @@ void PortableHostApp::RendezvousWorker() {
                     hash_challenge)
               : std::vector<unsigned char>();
       const auto session_start = std::chrono::steady_clock::now();
+      bool saw_empty_login = false;
+      std::chrono::steady_clock::time_point manual_password_deadline;
+      unsigned long incoming_approval_token = 0;
+      ScopeExit incoming_approval_scope([this, &incoming_approval_token]() {
+        if (incoming_approval_token != 0) {
+          CompleteIncomingApproval(incoming_approval_token);
+          incoming_approval_token = 0;
+        }
+      });
 
       while (true) {
         if (IsAuxiliarySessionStopRequested()) {
@@ -16586,126 +16850,176 @@ void PortableHostApp::RendezvousWorker() {
         }
 
         const auto now = std::chrono::steady_clock::now();
-        const auto elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - session_start).count();
-        if (elapsed_ms >= static_cast<long long>(kLoginWaitTimeoutMs)) {
-          if (session_status != nullptr) {
-            *session_status = channel_name + L" auxiliary login wait timed out";
-          }
-          return false;
-        }
-        unsigned long remaining_ms = (kLoginWaitTimeoutMs - elapsed_ms) > 1000
-            ? 1000
-            : static_cast<unsigned long>((kLoginWaitTimeoutMs - elapsed_ms) > 0
-                                             ? (kLoginWaitTimeoutMs - elapsed_ms)
-                                             : 1);
-
-        frame.clear();
-        const TcpFramedConnection::ReceiveState login_state =
-            connection->ReceiveFrame(&frame, remaining_ms, session_status);
-        if (login_state != TcpFramedConnection::ReceiveState::kFrame) {
-          if (session_status != nullptr) {
-            const std::wstring previous = *session_status;
-            *session_status =
-                channel_name + L" auxiliary encrypted receive " +
-                describe_receive_state(login_state);
-            if (!previous.empty()) {
-              *session_status += L": ";
-              *session_status += previous;
-            }
-          }
-          return login_state == TcpFramedConnection::ReceiveState::kClosed;
-        }
-
-        LoginRequestData login_request;
-        if (!ParseLoginRequestMessage(frame, &login_request)) {
-          const SessionMessageType session_message = ParseSessionMessage(frame);
-          if (session_message.has_close_reason) {
+        if (manual_password_deadline.time_since_epoch().count() != 0) {
+          if (now >= manual_password_deadline) {
             if (session_status != nullptr) {
-              *session_status = channel_name + L" controller closed before auxiliary login";
-              if (!session_message.close_reason.empty()) {
-                *session_status += L": ";
-                *session_status += session_message.close_reason;
-              }
+              *session_status = incoming_approval_token != 0
+                  ? channel_name + L" auxiliary incoming approval timed out"
+                  : channel_name + L" auxiliary manual password entry timed out";
             }
             return true;
           }
-          if (session_status != nullptr) {
-            *session_status =
-                channel_name + L" received encrypted message, but it was not LoginRequest";
+        } else {
+          const auto elapsed_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(now - session_start).count();
+          if (elapsed_ms >= static_cast<long long>(kLoginWaitTimeoutMs)) {
+            if (session_status != nullptr) {
+              *session_status = channel_name + L" auxiliary login wait timed out";
+            }
+            return false;
           }
-          return false;
         }
-        AppendPortableHostLog(
-            L"login",
-            channel_name + L" parsed auxiliary encrypted LoginRequest: " +
-                DescribeLoginRequestForLog(login_request));
 
-        if (!login_request.has_file_transfer) {
-          if (session_status != nullptr) {
-            *session_status = channel_name + L" ignored non-file-transfer auxiliary request";
-          }
-          connection->Abort();
-          return true;
+        unsigned long remaining_ms = 1000;
+        if (manual_password_deadline.time_since_epoch().count() != 0) {
+          const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+              manual_password_deadline - now).count();
+          remaining_ms = remaining > 1000
+              ? 1000
+              : (remaining > 0 ? static_cast<unsigned long>(remaining) : 1);
+        } else {
+          const auto elapsed_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(now - session_start).count();
+          const auto wait_left =
+              static_cast<long long>(kLoginWaitTimeoutMs) - elapsed_ms;
+          remaining_ms = wait_left > 1000
+              ? 1000
+              : (wait_left > 0 ? static_cast<unsigned long>(wait_left) : 1);
         }
 
         bool accepted_secondary_file_transfer = false;
         bool accepted_temporary_password = false;
         bool accepted_fixed_password = false;
-        if (login_request.password.empty()) {
-          if (should_auto_accept_secondary_file_transfer(login_request, display_remote_id)) {
-            accepted_secondary_file_transfer = true;
-            AppendPortableHostLog(
-                L"login",
-                channel_name +
-                    L" auto-accepted auxiliary encrypted file-transfer login");
-          } else {
-            const std::vector<unsigned char> wrong_password =
-                EncodeLoginResponseErrorMessage(kLoginMsgWrongPassword);
-            if (!connection->SendFrame(wrong_password, session_status)) {
-              if (session_status != nullptr && !session_status->empty()) {
-                *session_status =
-                    channel_name + L" wrong password response send failed: " + *session_status;
-              }
-              return false;
-            }
+        bool accepted_click_approval = false;
+        if (incoming_approval_token != 0) {
+          const IncomingApprovalDecision approval_decision =
+              GetIncomingApprovalDecision(incoming_approval_token);
+          if (approval_decision == IncomingApprovalDecision::kRejected) {
+            const std::vector<unsigned char> rejected =
+                EncodeLoginResponseErrorMessage(kLoginMsgClosedManuallyByPeer);
+            connection->SendFrame(rejected, nullptr);
             if (session_status != nullptr) {
-              *session_status =
-                  channel_name +
-                  L" auxiliary file-transfer login missing password and auto-accept did not match";
+              *session_status = channel_name + L" rejected auxiliary incoming request locally";
             }
-            AppendPortableHostLog(
-                L"login",
-                channel_name +
-                    L" auxiliary file-transfer login missing password and auto-accept did not match");
-            continue;
+            return true;
           }
-        } else {
-          accepted_temporary_password =
-              !expected_temporary_password.empty() &&
-              login_request.password == expected_temporary_password;
-          accepted_fixed_password =
-              !expected_fixed_password.empty() &&
-              login_request.password == expected_fixed_password;
-          if (!accepted_temporary_password && !accepted_fixed_password) {
-            const std::vector<unsigned char> wrong_password =
-                EncodeLoginResponseErrorMessage(kLoginMsgWrongPassword);
-            if (!connection->SendFrame(wrong_password, session_status)) {
-              if (session_status != nullptr && !session_status->empty()) {
-                *session_status =
-                    channel_name + L" wrong password response send failed: " + *session_status;
+          if (approval_decision == IncomingApprovalDecision::kAccepted) {
+            accepted_click_approval = true;
+          }
+        }
+
+        LoginRequestData login_request;
+        if (!accepted_click_approval) {
+          frame.clear();
+          const TcpFramedConnection::ReceiveState login_state =
+              connection->ReceiveFrame(&frame, remaining_ms, session_status);
+          if (login_state != TcpFramedConnection::ReceiveState::kFrame) {
+            if (session_status != nullptr) {
+              if (login_state == TcpFramedConnection::ReceiveState::kTimeout &&
+                  manual_password_deadline.time_since_epoch().count() != 0) {
+                *session_status = incoming_approval_token != 0
+                    ? channel_name + L" waiting for local approval or password entry"
+                    : channel_name + L" waiting for manual password entry";
+                continue;
               }
-              return false;
+              const std::wstring previous = *session_status;
+              *session_status =
+                  channel_name + L" auxiliary encrypted receive " +
+                  describe_receive_state(login_state);
+              if (!previous.empty()) {
+                *session_status += L": ";
+                *session_status += previous;
+              }
+            }
+            return login_state == TcpFramedConnection::ReceiveState::kClosed ||
+                   manual_password_deadline.time_since_epoch().count() != 0;
+          }
+
+          if (!ParseLoginRequestMessage(frame, &login_request)) {
+            const SessionMessageType session_message = ParseSessionMessage(frame);
+            if (session_message.has_close_reason) {
+              if (session_status != nullptr) {
+                *session_status = channel_name + L" controller closed before auxiliary login";
+                if (!session_message.close_reason.empty()) {
+                  *session_status += L": ";
+                  *session_status += session_message.close_reason;
+                }
+              }
+              return true;
             }
             if (session_status != nullptr) {
               *session_status =
-                  channel_name + L" rejected auxiliary encrypted LoginRequest with wrong password";
+                  channel_name + L" received encrypted message, but it was not LoginRequest";
             }
-            AppendPortableHostLog(
-                L"login",
-                channel_name +
-                    L" rejected auxiliary encrypted LoginRequest with wrong password");
-            continue;
+            return false;
+          }
+          AppendPortableHostLog(
+              L"login",
+              channel_name + L" parsed auxiliary encrypted LoginRequest: " +
+                  DescribeLoginRequestForLog(login_request));
+
+          if (login_request.password.empty()) {
+            if (should_auto_accept_secondary_file_transfer(login_request, display_remote_id)) {
+              accepted_secondary_file_transfer = true;
+              AppendPortableHostLog(
+                  L"login",
+                  channel_name +
+                      L" auto-accepted auxiliary encrypted file-transfer login");
+            } else {
+              saw_empty_login = true;
+              if (incoming_approval_token == 0) {
+                incoming_approval_token = BeginIncomingApproval(
+                    display_remote_id.empty()
+                        ? login_request.my_id
+                        : display_remote_id,
+                    display_remote_id.empty()
+                        ? login_request.my_name
+                        : L"");
+              }
+              manual_password_deadline =
+                  std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(kIncomingApprovalTimeoutMs);
+              if (session_status != nullptr) {
+                *session_status =
+                    channel_name +
+                    L" received incoming auxiliary remote request; waiting for approval or password entry";
+              }
+              AppendPortableHostLog(
+                  L"login",
+                  channel_name +
+                      L" empty-password auxiliary encrypted login is waiting for local approval/password entry");
+              continue;
+            }
+          }
+
+          if (!accepted_secondary_file_transfer) {
+            accepted_temporary_password =
+                !expected_temporary_password.empty() &&
+                login_request.password == expected_temporary_password;
+            accepted_fixed_password =
+                !expected_fixed_password.empty() &&
+                login_request.password == expected_fixed_password;
+            if (!accepted_temporary_password && !accepted_fixed_password) {
+              const std::vector<unsigned char> wrong_password =
+                  EncodeLoginResponseErrorMessage(kLoginMsgWrongPassword);
+              if (!connection->SendFrame(wrong_password, session_status)) {
+                if (session_status != nullptr && !session_status->empty()) {
+                  *session_status =
+                      channel_name + L" wrong password response send failed: " + *session_status;
+                }
+                return false;
+              }
+              if (session_status != nullptr) {
+                *session_status =
+                    channel_name +
+                    L" rejected auxiliary encrypted LoginRequest with wrong password; waiting for retry";
+              }
+              AppendPortableHostLog(
+                  L"login",
+                  channel_name +
+                      L" rejected auxiliary encrypted LoginRequest with wrong password");
+              continue;
+            }
           }
         }
 
@@ -16717,29 +17031,72 @@ void PortableHostApp::RendezvousWorker() {
           }
           return false;
         }
+        if (session_status != nullptr) {
+          if (accepted_secondary_file_transfer) {
+            *session_status =
+                channel_name +
+                L" accepted secondary auxiliary file-transfer request and sent PeerInfo login response";
+          } else if (accepted_fixed_password) {
+            *session_status =
+                channel_name + L" accepted auxiliary fixed password and sent PeerInfo login response";
+          } else if (accepted_click_approval) {
+            *session_status =
+                channel_name +
+                L" accepted auxiliary incoming remote request by local confirmation and sent PeerInfo login response";
+          } else {
+            *session_status = saw_empty_login
+                                  ? channel_name + L" accepted auxiliary manual LoginRequest and sent PeerInfo login response"
+                                  : channel_name + L" accepted auxiliary LoginRequest and sent PeerInfo login response";
+          }
+        }
         AppendPortableHostLog(
             L"login",
             channel_name +
                 L" sent auxiliary encrypted PeerInfo login response; secondary_file_transfer=" +
                 BoolToLogText(accepted_secondary_file_transfer) +
                 L", fixed_password=" + BoolToLogText(accepted_fixed_password) +
-                L", temporary_password=" + BoolToLogText(accepted_temporary_password));
+                L", temporary_password=" + BoolToLogText(accepted_temporary_password) +
+                L", click_approval=" + BoolToLogText(accepted_click_approval) +
+                L", manual_login=" + BoolToLogText(saw_empty_login));
 
         std::wstring connected_remote_id;
         std::wstring connected_remote_name;
-        if (!display_remote_id.empty()) {
+        if (accepted_click_approval) {
+          CaptureIncomingApprovalRemoteIdentity(
+              &connected_remote_id,
+              &connected_remote_name);
+        } else if (!display_remote_id.empty()) {
           connected_remote_id = display_remote_id;
         } else {
           connected_remote_id = login_request.my_id;
           connected_remote_name = login_request.my_name;
         }
-        return run_file_transfer_session_loop(
+        if (incoming_approval_token != 0) {
+          CompleteIncomingApproval(incoming_approval_token);
+          incoming_approval_token = 0;
+        }
+        if (login_request.has_file_transfer) {
+          return run_file_transfer_session_loop(
+              connection,
+              channel_name,
+              connected_remote_id,
+              connected_remote_name,
+              login_request.file_transfer_dir,
+              login_request.file_transfer_show_hidden,
+              session_status);
+        }
+        if (!connection->SendFrame(EncodeCliprdrMonitorReadyMessage(), session_status)) {
+          if (session_status != nullptr && !session_status->empty()) {
+            *session_status = channel_name + L" cliprdr monitor-ready send failed: " + *session_status;
+          }
+          return false;
+        }
+        return run_desktop_session_loop(
             connection,
             channel_name,
             connected_remote_id,
             connected_remote_name,
-            login_request.file_transfer_dir,
-            login_request.file_transfer_show_hidden,
+            true,
             session_status);
       }
     };
@@ -17177,6 +17534,13 @@ void PortableHostApp::RendezvousWorker() {
             std::function<bool(std::wstring*)> primary_runner,
             std::function<bool(std::wstring*)> auxiliary_runner) -> bool {
       if (has_primary_session_or_pending()) {
+        if (HasAuxiliarySession()) {
+          AppendPortableHostLog(
+              L"session",
+              L"rejecting incoming session request because auxiliary path is already occupied: " +
+                  starting_status);
+          return false;
+        }
         AppendPortableHostLog(
             L"session",
             L"routing incoming session request to auxiliary path: " + starting_status);
@@ -17316,18 +17680,6 @@ void PortableHostApp::RendezvousWorker() {
           reinterpret_cast<const char*>(&nodelay),
           sizeof(nodelay));
 
-      bool session_busy = HasActiveSession();
-      const bool active_running = session_busy;
-      bool pending_requested = false;
-      if (!session_busy) {
-        Win32LockGuard guard(active_session_mutex_);
-        pending_requested = pending_session_requested_;
-        session_busy = pending_requested;
-      } else {
-        Win32LockGuard guard(active_session_mutex_);
-        pending_requested = pending_session_requested_;
-      }
-
       std::wstring peer_host;
       std::array<wchar_t, NI_MAXHOST> host = {};
       if (GetNameInfoW(
@@ -17345,17 +17697,6 @@ void PortableHostApp::RendezvousWorker() {
           L"accepted socket from " +
               (peer_host.empty() ? std::wstring(L"<unknown>") : peer_host) +
               L" on port " + std::to_wstring(direct_access_listener_port));
-      if (session_busy) {
-        AppendPortableHostLog(
-            L"direct-ip",
-            L"closing accepted socket because session is busy; peer=" +
-                (peer_host.empty() ? std::wstring(L"<unknown>") : peer_host) +
-                L", active_running=" + BoolToLogText(active_running) +
-                L", pending_session_requested=" + BoolToLogText(pending_requested));
-        closesocket(accepted);
-        return;
-      }
-
       std::wstring starting_status =
           L"online, direct IP access request received";
       if (!peer_host.empty()) {
@@ -17366,30 +17707,43 @@ void PortableHostApp::RendezvousWorker() {
       starting_status += std::to_wstring(direct_access_listener_port);
       starting_status += L")";
 
-      if (!StartActiveSessionThread(
+      if (!start_session_or_auxiliary(
               starting_status,
               registered,
               L"direct IP session failed: ",
               [run_minimal_direct_ip_session_over_connection,
                accepted,
                peer_host](std::wstring* session_status) -> bool {
-                TcpFramedConnection direct_connection;
-                direct_connection.AttachSocket(accepted);
-                return run_minimal_direct_ip_session_over_connection(
-                    &direct_connection,
-                    L"direct IP session",
-                    peer_host,
-                    session_status);
-              })) {
+                 TcpFramedConnection direct_connection;
+                 direct_connection.AttachSocket(accepted);
+                 return run_minimal_direct_ip_session_over_connection(
+                     &direct_connection,
+                     L"direct IP session",
+                     peer_host,
+                     false,
+                     session_status);
+               },
+               [run_minimal_direct_ip_session_over_connection,
+                accepted,
+                peer_host](std::wstring* session_status) -> bool {
+                 TcpFramedConnection direct_connection;
+                 direct_connection.AttachSocket(accepted);
+                 return run_minimal_direct_ip_session_over_connection(
+                     &direct_connection,
+                     L"direct IP auxiliary session",
+                     peer_host,
+                     true,
+                     session_status);
+               })) {
         AppendPortableHostLog(
             L"direct-ip",
-            L"failed to dispatch accepted socket into active session thread; peer=" +
+            L"failed to dispatch accepted socket into direct session thread; peer=" +
                 (peer_host.empty() ? std::wstring(L"<unknown>") : peer_host));
         closesocket(accepted);
       } else {
         AppendPortableHostLog(
             L"direct-ip",
-            L"accepted socket dispatched into active session thread; peer=" +
+            L"accepted socket dispatched into primary/auxiliary direct session thread; peer=" +
                 (peer_host.empty() ? std::wstring(L"<unknown>") : peer_host));
       }
     };
