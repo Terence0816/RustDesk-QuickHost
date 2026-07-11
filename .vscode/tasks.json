@@ -1,0 +1,44 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build RustDeskQS (Debug x86)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\build.ps1",
+        "-Configuration",
+        "Debug",
+        "-Platform",
+        "x86"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Build RustDeskQS (Release x86)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\build.ps1",
+        "-Configuration",
+        "Release",
+        "-Platform",
+        "x86"
+      ],
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}

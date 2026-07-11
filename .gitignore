@@ -56,6 +56,13 @@ obj/
 *.7z
 *.rar
 
+third_party/vcpkg/*
+
+# zstd source code - cloned automatically by build.ps1
+third_party/zstd/
+third_party/zstd/.xp_patch_applied
+!third_party/zstd/.gitkeep
+
 # Keep source/resource files
 !resources/*.ico
 !assets/screenshots/*.png

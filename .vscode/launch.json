@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug RustDeskQS (x86)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\build\\debug-x86\\RustDeskQS.exe",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build RustDeskQS (Debug x86)",
+      "stopAtEntry": false,
+      "environment": []
+    },
+    {
+      "name": "Release RustDeskQS (x86)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${env:ComSpec}",
+      "args": [
+        "/c",
+        "echo Release build completed"
+      ],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build RustDeskQS (Release x86)",
+      "stopAtEntry": false,
+      "environment": []
+    }
+  ]
+}

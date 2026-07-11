@@ -1,0 +1,418 @@
+From e14e8dac0d21e486b85bde74ef6fc6574ccbdec2 Mon Sep 17 00:00:00 2001
+From: jimmyleocn <taroer@gmail.com>
+Date: Sun, 30 Mar 2025 23:10:22 +0800
+Subject: [PATCH] refactor: initial version of Windows XP-compatible
+ implementation
+
+---
+ README.md                    |  43 +++++++
+ README_CN.md                 |  36 ++++++
+ lib/common/threading.c       | 224 ++++++++++++++++++++++++++++++++++-
+ lib/common/threading.h       |  25 +++-
+ lib/compress/zstd_compress.c |   2 +-
+ 5 files changed, 325 insertions(+), 5 deletions(-)
+ create mode 100644 README_CN.md
+
+diff --git a/README.md b/README.md
+index d91ef5df1b2..9f172ca2000 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,46 @@
++[阅读中文版本 (Read Chinese Version)](README_CN.md)
++
++---
++
++# Zstandard (zstd) - Windows XP Compatibility Fork
++
++## About This Fork
++
++**This project is a fork of the official [facebook/zstd](https://github.com/facebook/zstd) repository, aiming to add Windows XP compatibility to zstd's multithreading feature.**
++
++Since the official stance in [Issue #932](https://github.com/facebook/zstd/issues/932) indicates that official compatibility support for Windows XP will not be provided, this fork was created to meet related needs.
++
++## Main Changes: Windows XP Multithreading Compatibility
++
++The core modification in this fork enables the zstd library with multithreading support (`ZSTD_MULTITHREAD`) to compile and run correctly on Windows XP systems. Newer versions of the original zstd rely on native Condition Variables available only in Windows Vista and later, which are absent in Windows XP.
++
++This fork addresses the compatibility issue through the following methods:
++
++*   **Target Platform Setting:** In `lib/common/threading.h`, `WINVER` and `_WIN32_WINNT` are explicitly set to `0x0501` for the Windows platform to ensure the use of XP-compatible APIs.
++*   **Simulated Condition Variables:** In `lib/common/threading.c`, the wait, signal, and broadcast behaviors of condition variables are simulated using standard synchronization primitives supported by Windows XP—**Mutex** and **Event**—providing a Pthreads-compatible interface.
++
++With these modifications, the multithreaded zstd library built using this fork should theoretically run in Windows XP SP2/SP3 environments.
++
++## Building
++
++The build steps are largely the same as the original zstd project. Please refer to the official build documentation:
++[https://github.com/facebook/zstd/tree/dev/build](https://github.com/facebook/zstd/tree/dev/build)
++
++**Special Note for Windows XP:**
++When building on Windows, ensure your development environment (compiler, linker, Windows SDK) is configured to target Windows XP. For example, select an XP-compatible platform toolset in Visual Studio (like `v141_xp`), or add appropriate target platform compilation options when using MinGW/Clang. The code changes in this fork address API-level compatibility, but the final executable still relies on the correct toolchain setup to be compatible with the XP runtime.
++
++## License
++
++This fork inherits the original license of zstd. This project is released under the dual BSD and GPLv2 licenses. For details, please refer to the [LICENSE](LICENSE) and [COPYING](COPYING) files.
++
++## Disclaimer
++
++Windows XP is an End-of-Life (EOL) operating system for which Microsoft no longer provides security updates or technical support. Running any software (including this modified version of zstd) on Windows XP carries inherent security risks.
++
++This fork is provided "as is" to meet specific legacy system compatibility requirements. Users assume all risks associated with its use. It is recommended to use this only in special circumstances where upgrading the operating system is not feasible.
++
++---
++
+ <p align="center"><img src="https://raw.githubusercontent.com/facebook/zstd/dev/doc/images/zstd_logo86.png" alt="Zstandard"></p>
+ 
+ __Zstandard__, or `zstd` as short version, is a fast lossless compression algorithm,
+diff --git a/README_CN.md b/README_CN.md
+new file mode 100644
+index 00000000000..d833edd8a47
+--- /dev/null
++++ b/README_CN.md
+@@ -0,0 +1,36 @@
++# Zstandard (zstd) - Windows XP Compatibility Fork
++
++## 关于此 Fork
++
++**本项目是官方 [facebook/zstd](https://github.com/facebook/zstd) 仓库的一个分支，旨在为 zstd 的多线程功能添加 Windows XP 兼容性。**
++
++由于官方在 [Issue #932](https://github.com/facebook/zstd/issues/932) 中表示不会为 Windows XP 提供官方兼容支持，因此创建了此 fork 以满足相关需求。
++
++## 主要修改：Windows XP 多线程兼容性
++
++此 fork 的核心改动在于使启用了多线程支持 (`ZSTD_MULTITHREAD`) 的 zstd 库能够在 Windows XP 系统上正确编译和运行。原版 zstd 在较新版本中依赖于 Windows Vista 及更高版本才提供的原生条件变量 (Condition Variables)，而 Windows XP 缺乏此原生支持。
++
++本 fork 通过以下方式解决了兼容性问题：
++
++*   **目标平台设定:** 在 `lib/common/threading.h` 中，为 Windows 平台强制设定 `WINVER` 和 `_WIN32_WINNT` 为 `0x0501`，以确保使用 XP 兼容的 API。
++*   **模拟条件变量:** 在 `lib/common/threading.c` 中，利用 Windows XP 支持的标准同步原语——**互斥量 (Mutex)** 和 **事件 (Event)**——模拟实现了条件变量的等待 (wait)、信号 (signal) 和广播 (broadcast) 行为，并提供了与 Pthreads 兼容的接口。
++
++通过这些修改，使用此 fork 构建的多线程 zstd 库理论上可以在 Windows XP SP2/SP3 环境下运行。
++
++## 构建
++
++构建步骤与原始 zstd 项目基本一致。请参考官方构建文档：
++[https://github.com/facebook/zstd/tree/dev/build](https://github.com/facebook/zstd/tree/dev/build)
++
++**针对 Windows XP 的特别说明:**
++在 Windows 上构建时，请务必确保你的开发环境（编译器、链接器、Windows SDK）配置为面向 Windows XP。例如，在 Visual Studio 中选择兼容 XP 的平台工具集 (如 `v141_xp`)，或在使用 MinGW/Clang 时添加相应的目标平台编译选项。本 fork 中的代码修改解决了 API 级别的兼容性，但最终生成的可执行文件仍需依赖正确的工具链设置才能与 XP 运行时兼容。
++
++## 许可证
++
++此 fork 继承 zstd 的原始许可证。本项目在 BSD 和 GPLv2 双重许可下发布。详细信息请参阅 [LICENSE](LICENSE) 和 [COPYING](COPYING) 文件。
++
++## 免责声明
++
++Windows XP 是一个已停止生命周期 (End-of-Life) 的操作系统，微软已不再提供安全更新和技术支持。在 Windows XP 上运行任何软件（包括此修改版的 zstd）都存在固有的安全风险。
++
++此 fork 按“原样”提供，旨在满足特定的遗留系统兼容性需求，使用者需自行承担所有风险。建议仅在确实无法升级操作系统的特殊情况下使用。
+\ No newline at end of file
+diff --git a/lib/common/threading.c b/lib/common/threading.c
+index 25bb8b98104..204259d1fb2 100644
+--- a/lib/common/threading.c
++++ b/lib/common/threading.c
+@@ -1,4 +1,4 @@
+-/**
++﻿/**
+  * Copyright (c) 2016 Tino Reichardt
+  * All rights reserved.
+  *
+@@ -34,6 +34,228 @@ int g_ZSTD_threading_useless_symbol;
+ 
+ /* ===  Implementation  === */
+ 
++#if (_WIN32_WINNT < 0x0600) 
++/* Windows XP-compatible condition variable implementation */
++int ZSTD_pthread_cond_init(ZSTD_pthread_cond_t* cond, const void* unused)
++{
++	(void)unused;
++	if (NULL == cond)
++	{
++		return EINVAL;
++	}
++	
++	DWORD error = 0;
++	cond->waiters_count = 0;
++	cond->was_broadcast = 0;
++	cond->waiters_count_lock = NULL;
++	cond->signal_event = NULL;
++	cond->broadcast_event = NULL;
++	
++	if (NULL == (cond->waiters_count_lock = CreateMutex(NULL, FALSE, NULL))) 
++	{
++		error = GetLastError();
++		return (int)error;
++	}
++	
++	if (NULL == (cond->signal_event = CreateEvent(NULL, FALSE, FALSE, NULL))) 
++	{
++		error = GetLastError();
++		CloseHandle(cond->waiters_count_lock);
++		cond->waiters_count_lock = NULL;
++		return (int)error;
++	}
++	
++	if (NULL == (cond->broadcast_event = CreateEvent(NULL, TRUE, FALSE, NULL))) 
++	{
++		error = GetLastError();
++		CloseHandle(cond->waiters_count_lock);
++		CloseHandle(cond->signal_event);
++		cond->waiters_count_lock = NULL;
++		cond->signal_event = NULL;
++		return (int)error;
++	}
++	
++	return 0;
++}
++
++int ZSTD_pthread_cond_destroy(ZSTD_pthread_cond_t* cond)
++{
++	if (NULL == cond)
++	{
++		return EINVAL;
++	}
++
++	DWORD first_error = 0;
++
++	if (NULL != cond->waiters_count_lock) 
++	{
++		if (!CloseHandle(cond->waiters_count_lock)) 
++		{
++			if (0 == first_error)
++			{
++				first_error = GetLastError();
++			}
++		}
++		cond->waiters_count_lock = NULL;
++	}
++	
++	if (NULL != cond->signal_event) 
++	{
++		if (!CloseHandle(cond->signal_event)) 
++		{
++			if (0 == first_error)
++			{
++				first_error = GetLastError();
++			}
++		}
++		cond->signal_event = NULL;
++	}
++	
++	if (NULL != cond->broadcast_event) 
++	{
++		if (!CloseHandle(cond->broadcast_event)) 
++		{
++			if (0 == first_error)
++			{
++				first_error = GetLastError();
++			}
++		}
++		cond->broadcast_event = NULL;
++	}
++
++	cond->waiters_count = 0;
++	cond->was_broadcast = 0;
++
++	return (int)first_error;
++}
++
++int ZSTD_pthread_cond_wait(ZSTD_pthread_cond_t* cond, ZSTD_pthread_mutex_t* mutex)
++{
++	if (NULL == cond || NULL == mutex)
++	{
++		return EINVAL;
++	}    
++	
++	DWORD result = 0;
++	
++	if (WAIT_FAILED == WaitForSingleObject(cond->waiters_count_lock, INFINITE))
++	{
++		return (int)GetLastError();
++	}
++		
++	cond->waiters_count++;
++	
++	if (!ReleaseMutex(cond->waiters_count_lock)) 
++	{
++		result = GetLastError();
++		cond->waiters_count--;
++		return (int)result;
++	}
++	
++	ZSTD_pthread_mutex_unlock(mutex);
++	
++	HANDLE events[2] = { cond->signal_event, cond->broadcast_event };
++	DWORD wait_result = WaitForMultipleObjects(2, events, FALSE, INFINITE);
++	
++	if (WAIT_FAILED == WaitForSingleObject(cond->waiters_count_lock, INFINITE))
++	{
++		result = GetLastError();
++		ZSTD_pthread_mutex_lock(mutex);
++		return (int)result;
++	}
++
++	cond->waiters_count--;
++	size_t was_broadcast = cond->was_broadcast;    
++	if (was_broadcast && 0 == cond->waiters_count) 
++	{
++		if (!ResetEvent(cond->broadcast_event))
++		{
++			result = GetLastError();
++		}
++		cond->was_broadcast = 0;
++	}
++
++	if (!ReleaseMutex(cond->waiters_count_lock) && 0 == result)
++	{
++		result = GetLastError();
++		cond->waiters_count++;
++	}
++	
++	ZSTD_pthread_mutex_lock(mutex);
++	
++	if (0 != result)
++	{
++		return (int)result;
++	}
++	
++	return (wait_result == WAIT_OBJECT_0 || wait_result == WAIT_OBJECT_0 + 1) ? 0 : (int)GetLastError();
++}
++
++int ZSTD_pthread_cond_signal(ZSTD_pthread_cond_t* cond)
++{
++	if (NULL == cond)
++	{
++		return EINVAL;
++	}
++
++	if (WAIT_FAILED == WaitForSingleObject(cond->waiters_count_lock, INFINITE))
++	{
++		return (int)GetLastError();
++	}
++		
++	int have_waiters = cond->waiters_count > 0;
++	if (!ReleaseMutex(cond->waiters_count_lock)) 
++	{
++		return (int)GetLastError();
++	}
++	
++	if (have_waiters)
++	{
++		if (!SetEvent(cond->signal_event))
++		{
++			return (int)GetLastError();
++		}
++	}
++	
++	return 0;
++}
++
++int ZSTD_pthread_cond_broadcast(ZSTD_pthread_cond_t* cond)
++{
++	if (NULL == cond)
++	{
++		return EINVAL;
++	}
++	
++	if (WAIT_FAILED == WaitForSingleObject(cond->waiters_count_lock, INFINITE))
++	{
++		return (int)GetLastError();
++	}
++	
++	int have_waiters = 0;
++	if (cond->waiters_count > 0) 
++	{
++		cond->was_broadcast = 1;
++		have_waiters = 1;
++	}
++	
++	if (!ReleaseMutex(cond->waiters_count_lock)) 
++	{
++		return (int)GetLastError();
++	}
++	
++	if (have_waiters) 
++	{
++		if (!SetEvent(cond->broadcast_event))
++		{
++			return (int)GetLastError();
++		}
++	}
++	
++	return 0;
++}
++#endif /* Windows XP-compatible condition variable implementation */
++
+ typedef struct {
+     void* (*start_routine)(void*);
+     void* arg;
+diff --git a/lib/common/threading.h b/lib/common/threading.h
+index e123cdf14a3..2905e09e53b 100644
+--- a/lib/common/threading.h
++++ b/lib/common/threading.h
+@@ -1,4 +1,4 @@
+-/**
++﻿/**
+  * Copyright (c) 2016 Tino Reichardt
+  * All rights reserved.
+  *
+@@ -24,12 +24,12 @@
+ #ifdef WINVER
+ #  undef WINVER
+ #endif
+-#define WINVER       0x0600
++#define WINVER       0x0501    /* Support Windows XP (0x0501) */
+ 
+ #ifdef _WIN32_WINNT
+ #  undef _WIN32_WINNT
+ #endif
+-#define _WIN32_WINNT 0x0600
++#define _WIN32_WINNT 0x0501    /* Support Windows XP (0x0501) */
+ 
+ #ifndef WIN32_LEAN_AND_MEAN
+ #  define WIN32_LEAN_AND_MEAN
+@@ -49,12 +49,31 @@
+ #define ZSTD_pthread_mutex_unlock(a)   LeaveCriticalSection((a))
+ 
+ /* condition variable */
++#if (_WIN32_WINNT >= 0x0600)  /* Vista+ has native condition variables */
+ #define ZSTD_pthread_cond_t             CONDITION_VARIABLE
+ #define ZSTD_pthread_cond_init(a, b)    ((void)(b), InitializeConditionVariable((a)), 0)
+ #define ZSTD_pthread_cond_destroy(a)    ((void)(a))
+ #define ZSTD_pthread_cond_wait(a, b)    SleepConditionVariableCS((a), (b), INFINITE)
+ #define ZSTD_pthread_cond_signal(a)     WakeConditionVariable((a))
+ #define ZSTD_pthread_cond_broadcast(a)  WakeAllConditionVariable((a))
++#else
++/* Windows XP-compatible condition variable implementation */
++typedef struct {
++    HANDLE waiters_count_lock;
++    HANDLE signal_event;
++    HANDLE broadcast_event;
++    size_t waiters_count;
++    size_t was_broadcast;
++} win32_cond_t;
++
++typedef win32_cond_t ZSTD_pthread_cond_t;
++
++int ZSTD_pthread_cond_init(ZSTD_pthread_cond_t* cond, const void* unused);
++int ZSTD_pthread_cond_destroy(ZSTD_pthread_cond_t* cond);
++int ZSTD_pthread_cond_wait(ZSTD_pthread_cond_t* cond, ZSTD_pthread_mutex_t* mutex);
++int ZSTD_pthread_cond_signal(ZSTD_pthread_cond_t* cond);
++int ZSTD_pthread_cond_broadcast(ZSTD_pthread_cond_t* cond);
++#endif
+ 
+ /* ZSTD_pthread_create() and ZSTD_pthread_join() */
+ typedef HANDLE ZSTD_pthread_t;
+diff --git a/lib/compress/zstd_compress.c b/lib/compress/zstd_compress.c
+index d928b1d3ee3..ebcc89b6e7a 100644
+--- a/lib/compress/zstd_compress.c
++++ b/lib/compress/zstd_compress.c
+@@ -7317,7 +7317,7 @@ static size_t convertSequences_noRepcodes(
+  */
+ size_t ZSTD_convertBlockSequences(ZSTD_CCtx* cctx,
+                 const ZSTD_Sequence* const inSeqs, size_t nbSequences,
+-                int repcodeResolution)
++                int const repcodeResolution)
+ {
+     Repcodes_t updatedRepcodes;
+     size_t seqNb = 0;
