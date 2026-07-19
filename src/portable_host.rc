@@ -9,8 +9,8 @@ IDB_ICON_MORE_VERT RCDATA "..\\resources\\material_more_vert.png"
 IDB_ICON_REFRESH RCDATA "..\\resources\\material_refresh.png"
 
 1 VERSIONINFO
-FILEVERSION 1,1,2,3
-PRODUCTVERSION 1,1,2,3
+FILEVERSION 1,1,2,5
+PRODUCTVERSION 1,1,2,5
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -27,12 +27,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Terence0816"
             VALUE "FileDescription", "RustDesk QuickHost"
-            VALUE "FileVersion", "1.1.2.3"
+            VALUE "FileVersion", "1.1.2.5"
             VALUE "InternalName", "RustDeskQS.exe"
             VALUE "LegalCopyright", "Copyright (C) 2025-2026 Terence0816"
             VALUE "OriginalFilename", "RustDeskQS.exe"
             VALUE "ProductName", "RustDesk QuickHost for Windows XP/7/10/11 and WinPE"
-            VALUE "ProductVersion", "1.1.2.3"
+            VALUE "ProductVersion", "1.1.2.5"
         END
     END
     BLOCK "VarFileInfo"

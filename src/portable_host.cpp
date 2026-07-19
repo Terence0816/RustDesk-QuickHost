@@ -34,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <cwctype>
 #include <memory>
@@ -64,6 +65,10 @@
 
 #ifndef MOUSEEVENTF_HWHEEL
 #define MOUSEEVENTF_HWHEEL 0x01000
+#endif
+
+#ifndef MOUSEEVENTF_VIRTUALDESK
+#define MOUSEEVENTF_VIRTUALDESK 0x4000
 #endif
 
 #ifndef __ICodecAPI_INTERFACE_DEFINED__
@@ -629,7 +634,7 @@ constexpr int kCliprdrFileContentsRangeFlag = 0x00000002;
 constexpr size_t kClipboardFileTransferChunkSize = 64 * 1024;
 constexpr size_t kFileTransferBlockSize = 128 * 1024;
 constexpr wchar_t kProjectUrl[] = L"https://github.com/Terence0816/RustDesk-QuickHost";
-constexpr wchar_t kAboutDisplayVersion[] = L"1.1.2.4";
+constexpr wchar_t kAboutDisplayVersion[] = L"1.1.2.5";
 constexpr wchar_t kCppHostVersion[] = L"1.3.0-cpp";
 constexpr wchar_t kAppWindowTitle[] = L"RustDeskQS Host";
 constexpr wchar_t kAppWindowClassName[] = L"RustDeskCppPortableHostWindow";
@@ -1545,6 +1550,10 @@ struct MouseEventData {
   int y = 0;
   std::vector<int> modifiers;
 };
+
+std::atomic<bool> g_rustdesk_last_absolute_mouse_valid{false};
+std::atomic<LONG> g_rustdesk_last_absolute_mouse_x{0};
+std::atomic<LONG> g_rustdesk_last_absolute_mouse_y{0};
 
 struct KeyEventData {
   bool down = false;
@@ -6080,6 +6089,501 @@ bool CompressZstdBytes(
   return true;
 }
 
+
+int RustDeskFirstSetBitIndex(uint32_t value) {
+  if (value == 0) {
+    return -1;
+  }
+  int index = 0;
+  while ((value & 1U) == 0U) {
+    value >>= 1U;
+    ++index;
+  }
+  return index;
+}
+
+bool RustDeskGetBitmapMetadata(HBITMAP bitmap, BITMAP* metadata) {
+  if (bitmap == nullptr || metadata == nullptr) {
+    return false;
+  }
+  std::memset(metadata, 0, sizeof(*metadata));
+  return GetObjectW(
+             bitmap,
+             static_cast<int>(sizeof(*metadata)),
+             metadata) == static_cast<int>(sizeof(*metadata));
+}
+
+bool RustDeskReadColorCursorRgba(
+    HBITMAP color_bitmap,
+    int width,
+    int height,
+    std::vector<unsigned char>* colors) {
+  if (color_bitmap == nullptr || width < 1 || height < 1 || colors == nullptr) {
+    return false;
+  }
+
+  const size_t byte_count =
+      static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
+  if (byte_count < 16U || byte_count > 16U * 1024U * 1024U) {
+    return false;
+  }
+  colors->assign(byte_count, 0);
+
+  HDC screen_dc = GetDC(nullptr);
+  if (screen_dc == nullptr) {
+    colors->clear();
+    return false;
+  }
+  HDC bitmap_dc = CreateCompatibleDC(screen_dc);
+  if (bitmap_dc == nullptr) {
+    ReleaseDC(nullptr, screen_dc);
+    colors->clear();
+    return false;
+  }
+  HGDIOBJ old_bitmap = SelectObject(bitmap_dc, color_bitmap);
+  if (old_bitmap == nullptr || old_bitmap == HGDI_ERROR) {
+    DeleteDC(bitmap_dc);
+    ReleaseDC(nullptr, screen_dc);
+    colors->clear();
+    return false;
+  }
+
+  BITMAPV5HEADER header = {};
+  header.bV5Size = sizeof(header);
+  header.bV5Width = width;
+  header.bV5Height = -height;
+  header.bV5Planes = 1;
+  header.bV5BitCount = 32;
+  header.bV5Compression = BI_BITFIELDS;
+  header.bV5RedMask = 0x000000FFU;
+  header.bV5GreenMask = 0x0000FF00U;
+  header.bV5BlueMask = 0x00FF0000U;
+  header.bV5AlphaMask = 0xFF000000U;
+
+  const int copied_rows = GetDIBits(
+      bitmap_dc,
+      color_bitmap,
+      0,
+      static_cast<UINT>(height),
+      colors->data(),
+      reinterpret_cast<BITMAPINFO*>(&header),
+      DIB_RGB_COLORS);
+
+  SelectObject(bitmap_dc, old_bitmap);
+  DeleteDC(bitmap_dc);
+  ReleaseDC(nullptr, screen_dc);
+  if (copied_rows != height) {
+    colors->clear();
+    return false;
+  }
+
+  const int red_bit = RustDeskFirstSetBitIndex(header.bV5RedMask);
+  const int green_bit = RustDeskFirstSetBitIndex(header.bV5GreenMask);
+  const int blue_bit = RustDeskFirstSetBitIndex(header.bV5BlueMask);
+  if (red_bit < 0 || green_bit < 0 || blue_bit < 0) {
+    colors->clear();
+    return false;
+  }
+  const int red_index = red_bit / 8;
+  const int green_index = green_bit / 8;
+  const int blue_index = blue_bit / 8;
+  if (red_index < 0 || red_index > 3 ||
+      green_index < 0 || green_index > 3 ||
+      blue_index < 0 || blue_index > 3 ||
+      red_index == green_index || red_index == blue_index ||
+      green_index == blue_index) {
+    colors->clear();
+    return false;
+  }
+  const int alpha_index = 6 - red_index - green_index - blue_index;
+  if (alpha_index < 0 || alpha_index > 3) {
+    colors->clear();
+    return false;
+  }
+
+  for (size_t offset = 0; offset + 3U < colors->size(); offset += 4U) {
+    const unsigned char red = (*colors)[offset + red_index];
+    const unsigned char green = (*colors)[offset + green_index];
+    const unsigned char blue = (*colors)[offset + blue_index];
+    const unsigned char alpha = (*colors)[offset + alpha_index];
+    (*colors)[offset] = red;
+    (*colors)[offset + 1U] = green;
+    (*colors)[offset + 2U] = blue;
+    (*colors)[offset + 3U] = alpha;
+  }
+  return true;
+}
+
+bool RustDeskFixColorCursorMask(
+    std::vector<unsigned char>* mask_bits,
+    std::vector<unsigned char>* colors,
+    int width,
+    int height,
+    int mask_width_bytes) {
+  if (mask_bits == nullptr || colors == nullptr || width < 1 || height < 1 ||
+      mask_width_bytes < 1) {
+    return false;
+  }
+
+  bool any_alpha = false;
+  for (size_t offset = 3U; offset < colors->size(); offset += 4U) {
+    if ((*colors)[offset] != 0U) {
+      any_alpha = true;
+      break;
+    }
+  }
+  if (any_alpha) {
+    return false;
+  }
+
+  const size_t packed_width_bytes =
+      (static_cast<size_t>(width) + 7U) >> 3U;
+  const size_t mask_size = mask_bits->size();
+  for (int y = 0; y < height; ++y) {
+    for (size_t x_byte = 0; x_byte < packed_width_bytes; ++x_byte) {
+      const size_t packed_index =
+          static_cast<size_t>(y) * packed_width_bytes + x_byte;
+      const size_t bitmap_index =
+          static_cast<size_t>(y) * static_cast<size_t>(mask_width_bytes) + x_byte;
+      if (packed_index < mask_size && bitmap_index < mask_size) {
+        (*mask_bits)[packed_index] =
+            static_cast<unsigned char>(~(*mask_bits)[bitmap_index]);
+      }
+    }
+  }
+
+  const size_t bytes_per_row = static_cast<size_t>(width) * 4U;
+  for (int y = 0; y < height; ++y) {
+    unsigned char bit_mask = 0x80U;
+    for (int x = 0; x < width; ++x) {
+      const size_t mask_index =
+          static_cast<size_t>(y) * packed_width_bytes +
+          static_cast<size_t>(x >> 3);
+      const size_t pixel_index =
+          static_cast<size_t>(y) * bytes_per_row +
+          static_cast<size_t>(x) * 4U;
+      if (mask_index < mask_size && pixel_index + 3U < colors->size()) {
+        if (((*mask_bits)[mask_index] & bit_mask) == 0U) {
+          for (size_t channel = 0; channel < 4U; ++channel) {
+            if ((*colors)[pixel_index + channel] != 0U) {
+              (*mask_bits)[mask_index] ^= bit_mask;
+              for (size_t clear_channel = channel; clear_channel < 4U; ++clear_channel) {
+                (*colors)[pixel_index + clear_channel] = 0U;
+              }
+              break;
+            }
+          }
+        }
+      }
+      bit_mask >>= 1U;
+      if (bit_mask == 0U) {
+        bit_mask = 0x80U;
+      }
+    }
+  }
+
+  size_t pixel_index = 0;
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const size_t mask_index =
+          static_cast<size_t>(y) * packed_width_bytes +
+          static_cast<size_t>(x >> 3);
+      unsigned char alpha = 0xFFU;
+      if (mask_index < mask_size &&
+          (((*mask_bits)[mask_index] << (x & 7)) & 0x80U) == 0U) {
+        alpha = 0U;
+      }
+      if (pixel_index + 3U >= colors->size()) {
+        return false;
+      }
+      const unsigned char blue = (*colors)[pixel_index];
+      const unsigned char green = (*colors)[pixel_index + 1U];
+      const unsigned char red = (*colors)[pixel_index + 2U];
+      (*colors)[pixel_index] = red;
+      (*colors)[pixel_index + 1U] = green;
+      (*colors)[pixel_index + 2U] = blue;
+      (*colors)[pixel_index + 3U] = alpha;
+      pixel_index += 4U;
+    }
+  }
+  return true;
+}
+
+bool RustDeskHandleMonochromeCursorMask(
+    std::vector<unsigned char>* colors,
+    const std::vector<unsigned char>& mask_bits,
+    int width,
+    int height,
+    int mask_width_bytes,
+    int mask_height) {
+  if (colors == nullptr || width < 1 || height < 1 || mask_width_bytes < 1 ||
+      mask_height < height * 2) {
+    return false;
+  }
+  const size_t and_mask_size =
+      static_cast<size_t>(mask_width_bytes) * static_cast<size_t>(mask_height);
+  const size_t xor_offset =
+      static_cast<size_t>(height) * static_cast<size_t>(mask_width_bytes);
+  if (mask_bits.size() < and_mask_size || xor_offset >= mask_bits.size()) {
+    return false;
+  }
+
+  bool needs_outline = false;
+  size_t pixel_index = 0;
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const size_t byte_index =
+          static_cast<size_t>(y) * static_cast<size_t>(mask_width_bytes) +
+          static_cast<size_t>(x >> 3);
+      const int bit = 7 - (x & 7);
+      const unsigned char bit_value = static_cast<unsigned char>(1U << bit);
+      if (pixel_index + 3U >= colors->size() ||
+          byte_index >= mask_bits.size() ||
+          xor_offset + byte_index >= mask_bits.size()) {
+        return false;
+      }
+      const bool and_set = (mask_bits[byte_index] & bit_value) != 0U;
+      const bool xor_set = (mask_bits[xor_offset + byte_index] & bit_value) != 0U;
+      if (!and_set) {
+        const unsigned char value = xor_set ? 0xFFU : 0U;
+        (*colors)[pixel_index] = value;
+        (*colors)[pixel_index + 1U] = value;
+        (*colors)[pixel_index + 2U] = value;
+        (*colors)[pixel_index + 3U] = 0xFFU;
+      } else if (xor_set) {
+        (*colors)[pixel_index] = 0U;
+        (*colors)[pixel_index + 1U] = 0U;
+        (*colors)[pixel_index + 2U] = 0U;
+        (*colors)[pixel_index + 3U] = 0xFFU;
+        needs_outline = true;
+      } else {
+        (*colors)[pixel_index] = 0U;
+        (*colors)[pixel_index + 1U] = 0U;
+        (*colors)[pixel_index + 2U] = 0U;
+        (*colors)[pixel_index + 3U] = 0U;
+      }
+      pixel_index += 4U;
+    }
+  }
+  return needs_outline;
+}
+
+void RustDeskDrawCursorOutline(
+    const std::vector<unsigned char>& input,
+    int width,
+    int height,
+    std::vector<unsigned char>* output) {
+  if (output == nullptr || width < 1 || height < 1) {
+    return;
+  }
+  const int output_width = width + 2;
+  const int output_height = height + 2;
+  output->assign(
+      static_cast<size_t>(output_width) *
+          static_cast<size_t>(output_height) * 4U,
+      0U);
+
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const size_t input_index =
+          (static_cast<size_t>(y) * static_cast<size_t>(width) +
+           static_cast<size_t>(x)) * 4U;
+      if (input_index + 3U >= input.size() || input[input_index + 3U] == 0U) {
+        continue;
+      }
+      for (int outline_y = y; outline_y <= y + 2; ++outline_y) {
+        for (int outline_x = x; outline_x <= x + 2; ++outline_x) {
+          const size_t output_index =
+              (static_cast<size_t>(outline_y) *
+                   static_cast<size_t>(output_width) +
+               static_cast<size_t>(outline_x)) * 4U;
+          if (output_index + 3U < output->size()) {
+            (*output)[output_index] = 0xFFU;
+            (*output)[output_index + 1U] = 0xFFU;
+            (*output)[output_index + 2U] = 0xFFU;
+            (*output)[output_index + 3U] = 0xFFU;
+          }
+        }
+      }
+    }
+  }
+
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const size_t input_index =
+          (static_cast<size_t>(y) * static_cast<size_t>(width) +
+           static_cast<size_t>(x)) * 4U;
+      if (input_index + 3U >= input.size() || input[input_index + 3U] == 0U) {
+        continue;
+      }
+      const size_t output_index =
+          (static_cast<size_t>(y + 1) * static_cast<size_t>(output_width) +
+           static_cast<size_t>(x + 1)) * 4U;
+      if (output_index + 3U < output->size()) {
+        std::memcpy(output->data() + output_index, input.data() + input_index, 4U);
+      }
+    }
+  }
+}
+
+bool EncodeRustDeskCursorDataMessage(
+    HCURSOR cursor,
+    std::vector<unsigned char>* message,
+    std::wstring* error_text) {
+  if (cursor == nullptr || message == nullptr) {
+    return false;
+  }
+
+  ICONINFO icon_info = {};
+  if (!GetIconInfo(cursor, &icon_info)) {
+    if (error_text != nullptr) {
+      *error_text = L"GetIconInfo failed";
+    }
+    return false;
+  }
+
+  BITMAP mask_metadata = {};
+  const bool have_mask =
+      RustDeskGetBitmapMetadata(icon_info.hbmMask, &mask_metadata);
+  if (!have_mask || mask_metadata.bmWidth < 1 || mask_metadata.bmHeight < 1 ||
+      mask_metadata.bmWidth > 512 || mask_metadata.bmHeight > 1024 ||
+      mask_metadata.bmWidthBytes < 1) {
+    if (icon_info.hbmColor != nullptr) {
+      DeleteObject(icon_info.hbmColor);
+    }
+    if (icon_info.hbmMask != nullptr) {
+      DeleteObject(icon_info.hbmMask);
+    }
+    if (error_text != nullptr) {
+      *error_text = L"invalid cursor mask bitmap";
+    }
+    return false;
+  }
+
+  int width = mask_metadata.bmWidth;
+  int height = icon_info.hbmColor != nullptr
+      ? mask_metadata.bmHeight
+      : mask_metadata.bmHeight / 2;
+  if (height < 1 || width > 512 || height > 512) {
+    if (icon_info.hbmColor != nullptr) {
+      DeleteObject(icon_info.hbmColor);
+    }
+    if (icon_info.hbmMask != nullptr) {
+      DeleteObject(icon_info.hbmMask);
+    }
+    if (error_text != nullptr) {
+      *error_text = L"invalid cursor dimensions";
+    }
+    return false;
+  }
+
+  std::vector<unsigned char> mask_bits(
+      static_cast<size_t>(mask_metadata.bmWidthBytes) *
+          static_cast<size_t>(mask_metadata.bmHeight),
+      0U);
+  const LONG mask_bytes = GetBitmapBits(
+      icon_info.hbmMask,
+      static_cast<LONG>(mask_bits.size()),
+      mask_bits.data());
+  if (mask_bytes != static_cast<LONG>(mask_bits.size())) {
+    if (icon_info.hbmColor != nullptr) {
+      DeleteObject(icon_info.hbmColor);
+    }
+    DeleteObject(icon_info.hbmMask);
+    if (error_text != nullptr) {
+      *error_text = L"failed to read cursor mask bitmap";
+    }
+    return false;
+  }
+
+  std::vector<unsigned char> colors;
+  bool needs_outline = false;
+  if (icon_info.hbmColor != nullptr) {
+    if (!RustDeskReadColorCursorRgba(
+            icon_info.hbmColor, width, height, &colors)) {
+      DeleteObject(icon_info.hbmColor);
+      DeleteObject(icon_info.hbmMask);
+      if (error_text != nullptr) {
+        *error_text = L"failed to read color cursor bitmap";
+      }
+      return false;
+    }
+    needs_outline = RustDeskFixColorCursorMask(
+        &mask_bits,
+        &colors,
+        width,
+        height,
+        mask_metadata.bmWidthBytes);
+  } else {
+    colors.assign(
+        static_cast<size_t>(width) * static_cast<size_t>(height) * 4U,
+        0U);
+    needs_outline = RustDeskHandleMonochromeCursorMask(
+        &colors,
+        mask_bits,
+        width,
+        height,
+        mask_metadata.bmWidthBytes,
+        mask_metadata.bmHeight);
+  }
+
+  if (icon_info.hbmColor != nullptr) {
+    DeleteObject(icon_info.hbmColor);
+  }
+  if (icon_info.hbmMask != nullptr) {
+    DeleteObject(icon_info.hbmMask);
+  }
+
+  int hot_x = static_cast<int>(icon_info.xHotspot);
+  int hot_y = static_cast<int>(icon_info.yHotspot);
+  if (needs_outline) {
+    std::vector<unsigned char> outlined;
+    RustDeskDrawCursorOutline(colors, width, height, &outlined);
+    if (!outlined.empty()) {
+      colors.swap(outlined);
+      width += 2;
+      height += 2;
+      ++hot_x;
+      ++hot_y;
+    }
+  }
+
+  std::vector<unsigned char> compressed_colors;
+  if (!CompressZstdBytes(colors, &compressed_colors, error_text)) {
+    return false;
+  }
+
+  std::vector<unsigned char> cursor_data;
+  AppendVarintField(
+      1U,
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cursor)),
+      &cursor_data);
+  AppendSint32Field(2U, hot_x, &cursor_data);
+  AppendSint32Field(3U, hot_y, &cursor_data);
+  AppendVarintField(4U, static_cast<uint64_t>(width), &cursor_data);
+  AppendVarintField(5U, static_cast<uint64_t>(height), &cursor_data);
+  AppendBytesField(6U, compressed_colors, &cursor_data);
+
+  message->clear();
+  AppendLengthDelimitedField(12U, cursor_data, message);
+  return true;
+}
+
+bool TryGetVisibleRustDeskCursor(HCURSOR* cursor) {
+  if (cursor == nullptr) {
+    return false;
+  }
+  CURSORINFO cursor_info = {};
+  cursor_info.cbSize = sizeof(cursor_info);
+  if (!GetCursorInfo(&cursor_info) ||
+      (cursor_info.flags & CURSOR_SHOWING) == 0 ||
+      cursor_info.hCursor == nullptr) {
+    return false;
+  }
+  *cursor = cursor_info.hCursor;
+  return true;
+}
+
 UINT GetHtmlClipboardFormat() {
   static const UINT format = RegisterClipboardFormatW(L"HTML Format");
   return format;
@@ -8502,10 +9006,20 @@ void SendScancode(WORD scan, bool down) {
   if (scan == 0) {
     return;
   }
+
+  // RustDesk 1:1 / translate modes carry Windows scan codes with an E0/E1
+  // prefix in the high byte (for example Win = 0xE05B). Preserve the packed
+  // scan word and mark it as an extended key for SendInput.
+  const bool extended =
+      (scan & 0xFF00U) == 0xE000U || (scan & 0xFF00U) == 0xE100U;
+
   INPUT input = {};
   input.type = INPUT_KEYBOARD;
   input.ki.wScan = scan;
   input.ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0U : KEYEVENTF_KEYUP);
+  if (extended) {
+    input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+  }
   SendInput(1, &input, sizeof(input));
 }
 
@@ -8658,6 +9172,82 @@ bool SendLegacyCharacterInput(
   return true;
 }
 
+bool BuildRustDeskAbsoluteMouseMoveInput(
+    LONG screen_x,
+    LONG screen_y,
+    INPUT* input) {
+  if (input == nullptr) {
+    return false;
+  }
+
+  const int virtual_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  const int virtual_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  const int virtual_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  const int virtual_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  if (virtual_width < 1 || virtual_height < 1) {
+    return false;
+  }
+
+  const LONG clamped_x = static_cast<LONG>(ClampInt(
+      static_cast<int>(screen_x),
+      virtual_left,
+      virtual_left + virtual_width - 1));
+  const LONG clamped_y = static_cast<LONG>(ClampInt(
+      static_cast<int>(screen_y),
+      virtual_top,
+      virtual_top + virtual_height - 1));
+  const LONGLONG width_denominator = virtual_width > 1 ? virtual_width - 1 : 1;
+  const LONGLONG height_denominator = virtual_height > 1 ? virtual_height - 1 : 1;
+
+  std::memset(input, 0, sizeof(*input));
+  input->type = INPUT_MOUSE;
+  input->mi.dx = static_cast<LONG>(
+      (static_cast<LONGLONG>(clamped_x - virtual_left) * 65535LL) /
+      width_denominator);
+  input->mi.dy = static_cast<LONG>(
+      (static_cast<LONGLONG>(clamped_y - virtual_top) * 65535LL) /
+      height_denominator);
+  input->mi.dwFlags =
+      MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+  return true;
+}
+
+bool SendRustDeskAbsoluteMouseMove(LONG screen_x, LONG screen_y) {
+  INPUT input = {};
+  if (!BuildRustDeskAbsoluteMouseMoveInput(screen_x, screen_y, &input)) {
+    return false;
+  }
+  if (SendInput(1, &input, sizeof(input)) != 1) {
+    // Very old or restricted desktops can reject VIRTUALDESK injection. Keep
+    // SetCursorPos only as a compatibility fallback, not as the normal path.
+    if (!SetCursorPos(screen_x, screen_y)) {
+      return false;
+    }
+  }
+  g_rustdesk_last_absolute_mouse_x.store(screen_x);
+  g_rustdesk_last_absolute_mouse_y.store(screen_y);
+  g_rustdesk_last_absolute_mouse_valid.store(true);
+  return true;
+}
+
+void SendRustDeskMouseActionAtLastPosition(DWORD flags, DWORD mouse_data) {
+  INPUT inputs[2] = {};
+  UINT count = 0;
+  if (g_rustdesk_last_absolute_mouse_valid.load()) {
+    if (BuildRustDeskAbsoluteMouseMoveInput(
+            g_rustdesk_last_absolute_mouse_x.load(),
+            g_rustdesk_last_absolute_mouse_y.load(),
+            &inputs[count])) {
+      ++count;
+    }
+  }
+  inputs[count].type = INPUT_MOUSE;
+  inputs[count].mi.dwFlags = flags;
+  inputs[count].mi.mouseData = mouse_data;
+  ++count;
+  SendInput(count, inputs, sizeof(INPUT));
+}
+
 bool HandleMouseEvent(const MouseEventData& event, int display_width, int display_height) {
   const int event_type = event.mask & kMouseTypeMask;
   const int buttons = event.mask >> 3;
@@ -8666,55 +9256,82 @@ bool HandleMouseEvent(const MouseEventData& event, int display_width, int displa
     const DesktopCaptureBounds bounds = GetDesktopCaptureBounds();
     const int clamped_x = ClampInt(event.x, 0, display_width - 1);
     const int clamped_y = ClampInt(event.y, 0, display_height - 1);
-    SetCursorPos(bounds.origin_x + clamped_x, bounds.origin_y + clamped_y);
-  } else if (event_type == kMouseTypeMoveRelative) {
+    SendRustDeskAbsoluteMouseMove(
+        static_cast<LONG>(bounds.origin_x + clamped_x),
+        static_cast<LONG>(bounds.origin_y + clamped_y));
+    return true;
+  }
+
+  if (event_type == kMouseTypeMoveRelative) {
     INPUT input = {};
     input.type = INPUT_MOUSE;
     input.mi.dx = event.x;
     input.mi.dy = event.y;
     input.mi.dwFlags = MOUSEEVENTF_MOVE;
     SendInput(1, &input, sizeof(input));
+    POINT cursor = {};
+    if (GetCursorPos(&cursor)) {
+      g_rustdesk_last_absolute_mouse_x.store(cursor.x);
+      g_rustdesk_last_absolute_mouse_y.store(cursor.y);
+      g_rustdesk_last_absolute_mouse_valid.store(true);
+    }
     return true;
   }
 
-  INPUT input = {};
-  input.type = INPUT_MOUSE;
   switch (event_type) {
-    case kMouseTypeMove:
-      return true;
-    case kMouseTypeDown:
-      if (buttons & kMouseButtonLeft) input.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
-      if (buttons & kMouseButtonRight) input.mi.dwFlags |= MOUSEEVENTF_RIGHTDOWN;
-      if (buttons & kMouseButtonWheel) input.mi.dwFlags |= MOUSEEVENTF_MIDDLEDOWN;
-      if (buttons & kMouseButtonBack) { input.mi.dwFlags |= MOUSEEVENTF_XDOWN; input.mi.mouseData = XBUTTON1; }
-      if (buttons & kMouseButtonForward) { input.mi.dwFlags |= MOUSEEVENTF_XDOWN; input.mi.mouseData = XBUTTON2; }
+    case kMouseTypeDown: {
+      DWORD flags = 0;
+      DWORD mouse_data = 0;
+      if (buttons & kMouseButtonLeft) flags |= MOUSEEVENTF_LEFTDOWN;
+      if (buttons & kMouseButtonRight) flags |= MOUSEEVENTF_RIGHTDOWN;
+      if (buttons & kMouseButtonWheel) flags |= MOUSEEVENTF_MIDDLEDOWN;
+      if (buttons & kMouseButtonBack) {
+        flags |= MOUSEEVENTF_XDOWN;
+        mouse_data = XBUTTON1;
+      }
+      if (buttons & kMouseButtonForward) {
+        flags |= MOUSEEVENTF_XDOWN;
+        mouse_data = XBUTTON2;
+      }
+      if (flags != 0) {
+        SendRustDeskMouseActionAtLastPosition(flags, mouse_data);
+      }
       break;
-    case kMouseTypeUp:
-      if (buttons & kMouseButtonLeft) input.mi.dwFlags |= MOUSEEVENTF_LEFTUP;
-      if (buttons & kMouseButtonRight) input.mi.dwFlags |= MOUSEEVENTF_RIGHTUP;
-      if (buttons & kMouseButtonWheel) input.mi.dwFlags |= MOUSEEVENTF_MIDDLEUP;
-      if (buttons & kMouseButtonBack) { input.mi.dwFlags |= MOUSEEVENTF_XUP; input.mi.mouseData = XBUTTON1; }
-      if (buttons & kMouseButtonForward) { input.mi.dwFlags |= MOUSEEVENTF_XUP; input.mi.mouseData = XBUTTON2; }
+    }
+    case kMouseTypeUp: {
+      DWORD flags = 0;
+      DWORD mouse_data = 0;
+      if (buttons & kMouseButtonLeft) flags |= MOUSEEVENTF_LEFTUP;
+      if (buttons & kMouseButtonRight) flags |= MOUSEEVENTF_RIGHTUP;
+      if (buttons & kMouseButtonWheel) flags |= MOUSEEVENTF_MIDDLEUP;
+      if (buttons & kMouseButtonBack) {
+        flags |= MOUSEEVENTF_XUP;
+        mouse_data = XBUTTON1;
+      }
+      if (buttons & kMouseButtonForward) {
+        flags |= MOUSEEVENTF_XUP;
+        mouse_data = XBUTTON2;
+      }
+      if (flags != 0) {
+        SendRustDeskMouseActionAtLastPosition(flags, mouse_data);
+      }
       break;
+    }
     case kMouseTypeWheel:
     case kMouseTypeTrackpad:
       if (event.x != 0) {
-        input.mi.dwFlags = MOUSEEVENTF_HWHEEL;
-        input.mi.mouseData = static_cast<DWORD>(-event.x);
-        SendInput(1, &input, sizeof(input));
+        SendRustDeskMouseActionAtLastPosition(
+            MOUSEEVENTF_HWHEEL,
+            static_cast<DWORD>(-event.x));
       }
       if (event.y != 0) {
-        input.mi = {};
-        input.mi.dwFlags = MOUSEEVENTF_WHEEL;
-        input.mi.mouseData = static_cast<DWORD>(event.y);
+        SendRustDeskMouseActionAtLastPosition(
+            MOUSEEVENTF_WHEEL,
+            static_cast<DWORD>(event.y));
       }
       break;
     default:
       return false;
-  }
-
-  if (input.mi.dwFlags != 0) {
-    SendInput(1, &input, sizeof(input));
   }
   return true;
 }
@@ -16162,6 +16779,9 @@ void PortableHostApp::RendezvousWorker() {
         std::vector<unsigned char> i420_frame;
         const auto video_epoch = std::chrono::steady_clock::now();
         auto next_video_deadline = video_epoch;
+        auto next_cursor_probe = video_epoch;
+        HCURSOR last_sent_cursor = nullptr;
+        bool sent_cursor_data = false;
         bool use_vp8_runtime = start_with_vp8;
 
         while (!stop_video_thread.load() && !is_desktop_session_stop_requested()) {
@@ -16170,6 +16790,26 @@ void PortableHostApp::RendezvousWorker() {
             continue;
           }
           const auto now = std::chrono::steady_clock::now();
+          if (now >= next_cursor_probe) {
+            HCURSOR current_cursor = nullptr;
+            if (TryGetVisibleRustDeskCursor(&current_cursor) &&
+                (!sent_cursor_data || current_cursor != last_sent_cursor)) {
+              std::vector<unsigned char> cursor_message;
+              std::wstring cursor_error;
+              if (EncodeRustDeskCursorDataMessage(
+                      current_cursor, &cursor_message, &cursor_error)) {
+                if (!connection->SendFrame(cursor_message, nullptr)) {
+                  Win32LockGuard error_lock(video_thread_error_mutex);
+                  video_thread_error = L"cursor data send failed";
+                  video_thread_failed.store(true);
+                  return;
+                }
+                last_sent_cursor = current_cursor;
+                sent_cursor_data = true;
+              }
+            }
+            next_cursor_probe = now + std::chrono::milliseconds(50);
+          }
           if (!request_immediate_video.load() && now < next_video_deadline) {
             Sleep(2);
             continue;
@@ -17650,6 +18290,9 @@ void PortableHostApp::RendezvousWorker() {
           std::vector<unsigned char> i420_frame;
           const auto video_epoch = std::chrono::steady_clock::now();
           auto next_video_deadline = video_epoch;
+          auto next_cursor_probe = video_epoch;
+          HCURSOR last_sent_cursor = nullptr;
+          bool sent_cursor_data = false;
           bool use_vp8_runtime = start_with_vp8;
 
           while (!stop_video_thread.load() && !IsActiveSessionStopRequested()) {
@@ -17658,6 +18301,26 @@ void PortableHostApp::RendezvousWorker() {
               continue;
             }
             const auto now = std::chrono::steady_clock::now();
+            if (now >= next_cursor_probe) {
+              HCURSOR current_cursor = nullptr;
+              if (TryGetVisibleRustDeskCursor(&current_cursor) &&
+                  (!sent_cursor_data || current_cursor != last_sent_cursor)) {
+                std::vector<unsigned char> cursor_message;
+                std::wstring cursor_error;
+                if (EncodeRustDeskCursorDataMessage(
+                        current_cursor, &cursor_message, &cursor_error)) {
+                  if (!connection->SendFrame(cursor_message, nullptr)) {
+                    Win32LockGuard error_lock(video_thread_error_mutex);
+                    video_thread_error = L"cursor data send failed";
+                    video_thread_failed.store(true);
+                    return;
+                  }
+                  last_sent_cursor = current_cursor;
+                  sent_cursor_data = true;
+                }
+              }
+              next_cursor_probe = now + std::chrono::milliseconds(50);
+            }
             if (!request_immediate_video.load() && now < next_video_deadline) {
               Sleep(2);
               continue;
