@@ -636,11 +636,11 @@ constexpr size_t kFileTransferBlockSize = 128 * 1024;
 constexpr wchar_t kProjectUrl[] = L"https://github.com/Terence0816/RustDesk-QuickHost";
 constexpr wchar_t kAboutDisplayVersion[] = L"1.1.2.5";
 constexpr wchar_t kCppHostVersion[] = L"1.3.0-cpp";
-constexpr wchar_t kAppWindowTitle[] = L"RustDeskQS Host";
+constexpr wchar_t kAppWindowTitle[] = PORTABLE_HOST_APP_NAME L" Host";
 constexpr wchar_t kAppWindowClassName[] = L"RustDeskCppPortableHostWindow";
 constexpr wchar_t kStartupRunKeyPath[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-constexpr wchar_t kStartupRunValueName[] = L"RustDeskQSCppHost";
+constexpr wchar_t kStartupRunValueName[] = PORTABLE_HOST_APP_NAME L"CppHost";
 constexpr wchar_t kLoginMsgWrongPassword[] = L"Wrong Password";
 constexpr wchar_t kLoginMsgClosedManuallyByPeer[] = L"Closed manually by the peer";
 
@@ -650,7 +650,7 @@ struct LanguageEntry {
 };
 
 const LanguageEntry kTraditionalChineseLanguageEntries[] = {
-    {L"app_window_title", L"RustDeskQS Host"},
+    {L"app_window_title", PORTABLE_HOST_APP_NAME L" Host"},
     {L"tray_show_main", L"顯示主頁"},
     {L"tray_exit", L"離開"},
     {L"menu_launch_on_startup", L"開機啟動"},
@@ -696,7 +696,7 @@ const LanguageEntry kTraditionalChineseLanguageEntries[] = {
 };
 
 const LanguageEntry kEnglishLanguageEntries[] = {
-    {L"app_window_title", L"RustDeskQS Host"},
+    {L"app_window_title", PORTABLE_HOST_APP_NAME L" Host"},
     {L"tray_show_main", L"Show Main Window"},
     {L"tray_exit", L"Exit"},
     {L"menu_launch_on_startup", L"Launch on Startup"},
@@ -4514,7 +4514,7 @@ const wchar_t* LookupBuiltinLanguageEntry(
 
 std::wstring BuildDefaultLanguageFileContent(bool traditional) {
   std::wstring content;
-  content += L"# RustDeskQS Host language file\r\n";
+  content += L"# " PORTABLE_HOST_APP_NAME L" Host language file\r\n";
   content += L"# Copy this file to another name such as jp.txt and translate only the values.\r\n";
   content += L"# Keep the keys on the left side unchanged.\r\n";
   content += traditional ? L"_base=tw\r\n" : L"_base=en\r\n";
@@ -4837,7 +4837,7 @@ std::wstring ProtectLocalMachineString(const std::wstring& plain_text) {
   DATA_BLOB output_blob = {};
   if (!CryptProtectData(
           &input_blob,
-          L"RustDeskQSCPP",
+          PORTABLE_HOST_APP_NAME L"CPP",
           nullptr,
           nullptr,
           nullptr,
@@ -13734,10 +13734,10 @@ void PortableHostApp::LoadOrCreateConfig() {
   fixed_password_.clear();
 
   if (!FileExists(config_.config_path)) {
-    config_.id_server = L"rs-ny.rustdesk.com:21116";
-    config_.relay_server = L"rs-ny.rustdesk.com:21117";
+    config_.id_server = PORTABLE_HOST_DEFAULT_ID_SERVER;
+    config_.relay_server = PORTABLE_HOST_DEFAULT_RELAY_SERVER;
     config_.api_server.clear();
-    config_.key = L"OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
+    config_.key = PORTABLE_HOST_DEFAULT_KEY;
     config_.direct_access_enabled = true;
     config_.direct_access_port = kDefaultDirectAccessPort;
     config_.preferred_codec = NormalizePreferredCodec(L"h264");
@@ -13750,8 +13750,8 @@ void PortableHostApp::LoadOrCreateConfig() {
     return;
   }
 
-  config_.id_server = ReadIniString(L"server", L"id_server", L"rs-ny.rustdesk.com:21116");
-  config_.relay_server = ReadIniString(L"server", L"relay_server", L"rs-ny.rustdesk.com:21117");
+  config_.id_server = ReadIniString(L"server", L"id_server", PORTABLE_HOST_DEFAULT_ID_SERVER);
+  config_.relay_server = ReadIniString(L"server", L"relay_server", PORTABLE_HOST_DEFAULT_RELAY_SERVER);
   config_.api_server = ReadIniString(L"server", L"api_server", L"");
   config_.key = ReadIniString(L"server", L"key", L"");
   config_.host_id = ReadIniString(L"host", L"id", L"");
@@ -13779,13 +13779,13 @@ void PortableHostApp::LoadOrCreateConfig() {
   const ParsedHostPort relay_server = ParseHostPort(config_.relay_server, kDefaultRelayServerPort);
 
   if (config_.id_server.empty() || id_server.host.empty()) {
-    config_.id_server = L"rs-ny.rustdesk.com:21116";
+    config_.id_server = PORTABLE_HOST_DEFAULT_ID_SERVER;
   } else {
     config_.id_server = BuildDisplayEndpoint(id_server.host, id_server.port);
   }
 
   if (config_.relay_server.empty() || relay_server.host.empty()) {
-    config_.relay_server = L"rs-ny.rustdesk.com:21117";
+    config_.relay_server = PORTABLE_HOST_DEFAULT_RELAY_SERVER;
   } else {
     config_.relay_server = BuildDisplayEndpoint(relay_server.host, relay_server.port);
   }
@@ -13795,7 +13795,7 @@ void PortableHostApp::LoadOrCreateConfig() {
   }
 
   if (config_.key.empty() && IsRustDeskPublicHost(id_server.host)) {
-    config_.key = L"OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
+    config_.key = PORTABLE_HOST_DEFAULT_KEY;
   }
 
   if (config_.host_id.empty()) {
@@ -13869,11 +13869,11 @@ void PortableHostApp::SaveConfig() const {
   WriteIniString(
       L"server",
       L"id_server",
-      config_.id_server.empty() ? L"rs-ny.rustdesk.com:21116" : config_.id_server);
+      config_.id_server.empty() ? PORTABLE_HOST_DEFAULT_ID_SERVER : config_.id_server);
   WriteIniString(
       L"server",
       L"relay_server",
-      config_.relay_server.empty() ? L"rs-ny.rustdesk.com:21117" : config_.relay_server);
+      config_.relay_server.empty() ? PORTABLE_HOST_DEFAULT_RELAY_SERVER : config_.relay_server);
   WriteIniString(L"server", L"api_server", config_.api_server);
   WriteIniString(L"server", L"key", config_.key);
 

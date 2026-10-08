@@ -5,7 +5,8 @@
 
 namespace {
 
-constexpr wchar_t kSingleInstanceMutexName[] = L"Local\\RustDeskQSCppSingleInstance";
+constexpr wchar_t kSingleInstanceMutexName[] =
+  L"Local\\" PORTABLE_HOST_APP_NAME L"CppSingleInstance";
 
 HWND WaitForRunningInstanceWindow(DWORD wait_ms) {
   const DWORD started = GetTickCount();
@@ -85,8 +86,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     MessageBoxW(
         nullptr,
-        L"Another RustDeskQS Host instance is already starting or running.",
-        L"RustDeskQS Host",
+        L"Another " PORTABLE_HOST_APP_NAME L" Host instance is already starting or running.",
+        PORTABLE_HOST_APP_NAME L" Host",
         MB_ICONWARNING | MB_OK);
     if (single_instance_mutex != nullptr) {
       CloseHandle(single_instance_mutex);
@@ -99,7 +100,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     MessageBoxW(
         nullptr,
         L"Failed to start the portable C++ host shell.",
-        L"RustDeskQS Host",
+        PORTABLE_HOST_APP_NAME L" Host",
         MB_ICONERROR | MB_OK);
     if (single_instance_mutex != nullptr) {
       CloseHandle(single_instance_mutex);
